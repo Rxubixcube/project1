@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>2D Explorer & Editor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        // Import Firebase components
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, onSnapshot, setDoc, collection, getDoc, query, where, getDocs, runTransaction, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Set log level for debugging
+        setLogLevel('debug');
+
+        // Global variables provided by the environment (MANDATORY)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // --- GAME CONSTANTS & ANIMATION SETTINGS ---
+        const TILE_SIZE = 40; // Pixels per tile
+        const MAP_SIZE = 20; // 20x20 tiles
+        const CANVAS_SIZE = MAP_SIZE * TILE_SIZE; // 800x800
+
+        const LERP_FACTOR = 0.15; // Controls the speed of smooth movement
+        const TRAIL_FADE_RATE = 0.05;
+
+        const CURRENCY_NAME = 'Gold';
+        const STARTING_GOLD = 500;
+        
+        // Weapon templates define base stats and repair cost
+        const WEAPON_TEMPLATES = {
+            'sword': { name: 'Iron Sword', baseAttack: 5, baseDurability: 50, repairCost: 50 },
+            'bow': { name: 'Advanced Bow', baseAttack: 4, baseDurability: 40, repairCost: 40 },
+            'katana': { name: 'Samurai Katana', baseAttack: 6, baseDurability: 45, repairCost: 60 }
+        };
+        // Multipliers for weapon scaling
+        const DURABILITY_BONUS_PER_LEVEL = 25;
+        const ATTACK_BONUS_PER_LEVEL = 3;
+
+        // Tile IDs and their properties
+        const TILE_TYPES = {
+            GRASS: 0,
+            WALL: 1,
+            WATER: 2,
+            ROAD: 3,
+            FOREST: 4,
+            BUILDING: 5, 
+            TREE: 6,      
+        };
+
+        const TILE_PROPERTIES = [
+            { id: TILE_TYPES.GRASS, name: 'Grass', color: '#689f38', traversable: true },
+            { id: TILE_TYPES.WALL, name: 'Wall', color: '#5d4037', traversable: false },
+            { id: TILE_TYPES.WATER, name: 'Water', color: '#03a9f4', traversable: false },
+            { id: TILE_TYPES.ROAD, name: 'Road', color: '#bcaaa4', traversable: true },
+            { id: TILE_TYPES.FOREST, name: 'Forest', color: '#4a6b2c', traversable: true },
+            { id: TILE_TYPES.BUILDING, name: 'Building', color: '#795548', traversable: false }, 
+            { id: TILE_TYPES.TREE, name: 'Tree', color: '#004d40', traversable: false },         
+        ];
+
+        // --- GAME STATE ---
+        let db;
+        let auth;
+        let userId = null;
+        let isAuthReady = false;
+
+        let mapData = createEmptyMap(MAP_SIZE);
+        // Player state now includes currency and weapon
+        let player = { 
+            x: 9, 
+            y: 9, 
+            visualX: 9, 
+            visualY: 9,
+            currency: 0, 
+            weapon: null 
+        }; 
+        let mode = 'play'; 
+        let gameState = 'menu'; 
+        
+        // Animation state
+        let isMoving = false; 
+        let animationFrameId = null; 
+        let trailEffect = { x: -1, y: -1, opacity: 0 }; 
+
+        // --- FIREBASE SETUP AND AUTHENTICATION (FIXED) ---
+
+        async function initFirebase() {
+            try {
+                if (Object.keys(firebaseConfig).length === 0) {
+                    console.error("Firebase config is missing.");
+                    document.getElementById('message-box').innerHTML = createMessage('error', 'Firebase configuration is missing. Cannot save data.');
+                    return;
+                }
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // CRITICAL FIX: The listener must be set up *after* getAuth() has been called on the initialized app.
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        if (!userId) { // Prevents re-running startApp if already authenticated
+                            userId = user.uid;
+                            isAuthReady = true;
+                            document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+                            console.log("Authentication successful. User ID:", userId);
+                            startListeners();
+                            player.visualX = player.x; 
+                            player.visualY = player.y;
+                            player.weapon = player.weapon || initializePlayerWeapon();
+                            if (gameState === 'game' && !animationFrameId) {
+                                animate();
+                            }
+                        }
+                    } else {
+                        console.log("No user signed in.");
+                        isAuthReady = true; // Mark as ready even if anonymous
+                    }
+                });
+
+                // Sign in attempt (will trigger the onAuthStateChanged listener)
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+                
+            } catch (error) {
+                console.error("Error initializing Firebase or signing in:", error);
+                document.getElementById('message-box').innerHTML = createMessage('error', `Authentication failed: ${error.message}`);
+            }
+        }
+
+        // --- DATA PATH HELPERS ---
+
+        // Public path for the shared map data
+        function getMapDocRef() {
+            return doc(db, 'artifacts', appId, 'public', 'data', 'exploration_game', 'main_map');
+        }
+
+        // Private path for the user's player state
+        function getPlayerStateDocRef(uid) {
+            return doc(db, 'artifacts', appId, 'users', uid, 'game_state', 'player_state');
+        }
+
+        // --- WEAPON LOGIC ---
+
+        /**
+         * Initializes a new weapon object, setting base level.
+         * @param {string} type - The key from WEAPON_TEMPLATES.
+         * @returns {object} The initialized weapon object.
+         */
+        function initializePlayerWeapon(type = 'sword') {
+            const newWeapon = {
+                type: type,
+                level: 1,
+                currentDurability: 0, // Will be set to max by calculateWeaponStats
+            };
+            return calculateWeaponStats(newWeapon);
+        }
+
+        /**
+         * Calculates max durability and attack based on weapon level.
+         * @param {object} weapon - The weapon state object.
+         * @returns {object} The updated weapon state object.
+         */
+        function calculateWeaponStats(weapon) {
+            const template = WEAPON_TEMPLATES[weapon.type];
+            const level = weapon.level;
+
+            // Stats scale linearly with level
+            const maxDurability = template.baseDurability + (level - 1) * DURABILITY_BONUS_PER_LEVEL;
+            const attackPower = template.baseAttack + (level - 1) * ATTACK_BONUS_PER_LEVEL;
+            
+            weapon.maxDurability = maxDurability;
+            weapon.attackPower = attackPower;
+            
+            // If current durability is undefined (new object) or higher than new max (shouldn't happen), set to max.
+            if (weapon.currentDurability === undefined || weapon.currentDurability > maxDurability) {
+                weapon.currentDurability = maxDurability;
+            }
+
+            return weapon;
+        }
+
+        /**
+         * Attempts to upgrade the player's current weapon.
+         */
+        function upgradeWeapon() {
+            if (!player.weapon) return;
+            if (player.weapon.currentDurability < player.weapon.maxDurability) {
+                document.getElementById('message-box').innerHTML = createMessage('warning', `Weapon must be fully repaired before upgrading!`);
+                return;
+            }
+            
+            const nextLevel = player.weapon.level + 1;
+            // Upgrade Cost: Base Repair Cost * (Level^2)
+            const upgradeCost = WEAPON_TEMPLATES[player.weapon.type].repairCost * nextLevel * nextLevel; 
+
+            if (player.currency < upgradeCost) {
+                document.getElementById('message-box').innerHTML = createMessage('error', `Not enough ${CURRENCY_NAME}! Requires ${upgradeCost}.`);
+                return;
+            }
+
+            player.currency -= upgradeCost;
+            player.weapon.level = nextLevel;
+            
+            // Recalculate stats and set durability to new max
+            player.weapon = calculateWeaponStats(player.weapon); 
+            player.weapon.currentDurability = player.weapon.maxDurability;
+
+            document.getElementById('message-box').innerHTML = createMessage('success', `Weapon upgraded to Level ${nextLevel}! Cost: ${upgradeCost} ${CURRENCY_NAME}.`);
+            savePlayerState();
+            updateWeaponUI();
+        }
+
+        /**
+         * Attempts to repair the player's current weapon to max durability.
+         */
+        function repairWeapon() {
+            if (!player.weapon) return;
+            if (player.weapon.currentDurability === player.weapon.maxDurability) {
+                document.getElementById('message-box').innerHTML = createMessage('info', `Weapon durability is already full.`);
+                return;
+            }
+
+            const missingDurability = player.weapon.maxDurability - player.weapon.currentDurability;
+            // Repair cost is 1 Gold per point of missing durability
+            const repairCost = missingDurability * 1; 
+
+            if (player.currency < repairCost) {
+                document.getElementById('message-box').innerHTML = createMessage('error', `Not enough ${CURRENCY_NAME}! Requires ${repairCost} to fully repair.`);
+                return;
+            }
+
+            player.currency -= repairCost;
+            player.weapon.currentDurability = player.weapon.maxDurability;
+
+            document.getElementById('message-box').innerHTML = createMessage('success', `Weapon fully repaired! Cost: ${repairCost} ${CURRENCY_NAME}.`);
+            savePlayerState();
+            updateWeaponUI();
+        }
+
+        /**
+         * Mock function to simulate weapon usage and durability loss.
+         */
+        function useWeapon() {
+            if (!player.weapon) return;
+            if (player.weapon.currentDurability <= 0) {
+                document.getElementById('message-box').innerHTML = createMessage('warning', `Weapon is broken! Must be repaired.`);
+                return;
+            }
+            
+            // Randomly lose 1 to 5 durability
+            const damage = Math.floor(Math.random() * 5) + 1;
+            player.weapon.currentDurability = Math.max(0, player.weapon.currentDurability - damage);
+
+            document.getElementById('message-box').innerHTML = createMessage('info', `Weapon used (Damage: ${player.weapon.attackPower})! Durability lost: ${damage}.`);
+            
+            // If weapon breaks, notify user
+            if (player.weapon.currentDurability === 0) {
+                document.getElementById('message-box').innerHTML = createMessage('error', `Weapon BROKEN! Please repair it now.`);
+            }
+
+            savePlayerState();
+            updateWeaponUI();
+        }
+
+        // --- MAP AND PLAYER MANAGEMENT ---
+
+        function createEmptyMap(size) {
+            return Array(size).fill(0).map(() => Array(size).fill(TILE_TYPES.GRASS));
+        }
+
+        /**
+         * Generates a new, random map.
+         */
+        function generateProceduralMap() {
+            const newMap = createEmptyMap(MAP_SIZE);
+            let riverY = Math.floor(MAP_SIZE * 0.3 + Math.random() * MAP_SIZE * 0.4); 
+            
+            for (let x = 0; x < MAP_SIZE; x++) {
+                if (riverY >= 0 && riverY < MAP_SIZE) {
+                    newMap[riverY][x] = TILE_TYPES.WATER;
+                }
+                if (riverY + 1 < MAP_SIZE) newMap[riverY + 1][x] = TILE_TYPES.WATER;
+
+                const shift = Math.floor(Math.random() * 3) - 1; 
+                riverY += shift;
+                riverY = Math.max(0, Math.min(MAP_SIZE - 2, riverY));
+            }
+
+            for (let y = 0; y < MAP_SIZE; y++) {
+                for (let x = 0; x < MAP_SIZE; x++) {
+                    if (newMap[y][x] === TILE_TYPES.WATER) continue;
+                    if (Math.random() < 0.10) { 
+                        newMap[y][x] = TILE_TYPES.TREE;
+                    } else if (Math.random() < 0.05) { 
+                        newMap[y][x] = TILE_TYPES.FOREST;
+                    }
+                }
+            }
+            
+            newMap[player.y][player.x] = TILE_TYPES.GRASS;
+
+            return newMap;
+        }
+
+
+        function startListeners() {
+            if (!isAuthReady || !userId || !db) return;
+
+            // 1. Listen for Map Data (Public)
+            onSnapshot(getMapDocRef(), (docSnapshot) => {
+                if (docSnapshot.exists()) {
+                    const data = docSnapshot.data();
+                    if (data.tiles) {
+                        try {
+                            mapData = JSON.parse(data.tiles); 
+                            console.log("Map data loaded/updated from Firestore.");
+                        } catch (e) {
+                            console.error("Error parsing map data:", e);
+                            document.getElementById('message-box').innerHTML = createMessage('error', 'Map data corruption detected. Resetting map.');
+                            mapData = createEmptyMap(MAP_SIZE);
+                        }
+                    }
+                } else {
+                    console.log("No map data found. Initializing new map...");
+                    saveMapToFirestore(createEmptyMap(MAP_SIZE));
+                }
+            }, (error) => {
+                console.error("Error listening to map data:", error);
+                document.getElementById('message-box').innerHTML = createMessage('warning', 'Failed to load map data in real-time. Check console for details.');
+            });
+
+            // 2. Listen for Player State (Private)
+            onSnapshot(getPlayerStateDocRef(userId), (docSnapshot) => {
+                if (docSnapshot.exists()) {
+                    const data = docSnapshot.data();
+                    
+                    player.x = data.x ?? player.x;
+                    player.y = data.y ?? player.y;
+                    
+                    // Load Currency
+                    player.currency = data.currency ?? STARTING_GOLD; 
+                    
+                    // Load Weapon state
+                    if (data.weapon) {
+                        try {
+                            // Calculate stats based on level, then load current durability
+                            const loadedWeapon = JSON.parse(data.weapon);
+                            player.weapon = calculateWeaponStats(loadedWeapon);
+                            player.weapon.currentDurability = loadedWeapon.currentDurability ?? player.weapon.maxDurability;
+                        } catch (e) {
+                            console.error("Error parsing weapon data:", e);
+                            player.weapon = initializePlayerWeapon();
+                        }
+                    } else {
+                        player.weapon = initializePlayerWeapon();
+                    }
+                    
+                    console.log(`Player state loaded/updated: (${player.x}, ${player.y})`);
+                    
+                    if (gameState === 'game') {
+                        updateWeaponUI();
+                        if (!animationFrameId) {
+                            animate();
+                        }
+                    }
+                } else {
+                    console.log("No player state found. Initializing state...");
+                    player.currency = STARTING_GOLD;
+                    player.weapon = initializePlayerWeapon();
+                    savePlayerState();
+                }
+            }, (error) => {
+                console.error("Error listening to player state:", error);
+                document.getElementById('message-box').innerHTML = createMessage('warning', 'Failed to load player state. Check console for details.');
+            });
+        }
+
+        async function saveMapToFirestore(newMap = mapData) {
+            if (!isAuthReady || !userId || !db) {
+                document.getElementById('message-box').innerHTML = createMessage('error', 'Cannot save: Authentication not ready.');
+                return;
+            }
+
+            try {
+                const serializedMap = JSON.stringify(newMap);
+
+                await setDoc(getMapDocRef(), {
+                    tiles: serializedMap,
+                    last_updated: new Date().toISOString(),
+                    editor_id: userId
+                });
+                console.log("Map saved successfully!");
+                document.getElementById('message-box').innerHTML = createMessage('success', 'Map updated and saved.');
+            } catch (error) {
+                console.error("Error saving map:", error);
+                document.getElementById('message-box').innerHTML = createMessage('error', `Save failed: ${error.message}`);
+            }
+        }
+
+        async function savePlayerState() {
+            if (!isAuthReady || !userId || !db) return;
+            try {
+                await setDoc(getPlayerStateDocRef(userId), {
+                    x: player.x,
+                    y: player.y,
+                    currency: player.currency,
+                    // Save the weapon object (only the type, level, and currentDurability)
+                    weapon: JSON.stringify({
+                        type: player.weapon.type,
+                        level: player.weapon.level,
+                        currentDurability: player.weapon.currentDurability
+                    }),
+                    last_update: new Date().toISOString()
+                }, { merge: true });
+            } catch (error) {
+                console.error("Error saving player state:", error);
+            }
+        }
+
+        // --- GAME CANVAS DRAWING & ANIMATION ---
+
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        /**
+         * Main animation loop.
+         */
+        function animate() {
+            // 1. Interpolate visual position (Smooth Movement)
+            const targetX = player.x;
+            const targetY = player.y;
+
+            player.visualX += (targetX - player.visualX) * LERP_FACTOR;
+            player.visualY += (targetY - player.visualY) * LERP_FACTOR;
+
+            const distanceSquared = (targetX - player.visualX)**2 + (targetY - player.visualY)**2;
+            
+            if (distanceSquared < 0.001) { 
+                player.visualX = player.x;
+                player.visualY = player.y;
+                isMoving = false;
+            } else {
+                isMoving = true;
+            }
+
+            // 2. Fade out trail effect
+            if (trailEffect.opacity > 0) {
+                trailEffect.opacity = Math.max(0, trailEffect.opacity - TRAIL_FADE_RATE);
+            }
+
+            // 3. Redraw the entire game state
+            drawGame();
+
+            // 4. Loop: Continue if in game state or if movement/effects are ongoing
+            if (gameState === 'game' || isMoving || trailEffect.opacity > 0) {
+                animationFrameId = requestAnimationFrame(animate);
+            } else {
+                animationFrameId = null; // Stop loop when idle
+            }
+        }
+
+        // Helper function to draw the avatar icon with smooth effects
+        function drawAvatar(x, y, size) {
+            
+            let scaleFactor = 1.0;
+            if (isMoving) {
+                const time = performance.now() * 0.005; 
+                // Subtle bobbing effect
+                scaleFactor = 1.0 + Math.abs(Math.sin(time * 5)) * 0.1; 
+            }
+
+            const centerX = x * TILE_SIZE + TILE_SIZE / 2;
+            const centerY = y * TILE_SIZE + TILE_SIZE / 2;
+            const headRadius = size / 3;
+            const bodyHeight = size / 2;
+
+            ctx.shadowColor = 'transparent';
+            ctx.shadowBlur = 0;
+            ctx.shadowOffsetX = 0;
+            ctx.shadowOffsetY = 0;
+
+            // Apply scaling transform
+            ctx.save();
+            ctx.translate(centerX, centerY);
+            ctx.scale(scaleFactor, scaleFactor);
+            ctx.translate(-centerX, -centerY);
+
+
+            // 1. Head (Circle) - Duller color
+            ctx.fillStyle = '#b7a28
