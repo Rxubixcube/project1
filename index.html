@@ -3,13 +3,13 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>2D Explorer & Editor</title>
+    <title>2D Explorer & Editor (Responsive)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script type="module">
         // Import Firebase components
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, onSnapshot, setDoc, collection, getDoc, query, where, getDocs, runTransaction, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, doc, onSnapshot, setDoc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // Set log level for debugging
         setLogLevel('debug');
@@ -19,16 +19,15 @@
         const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
-        // --- GAME CONSTANTS & ANIMATION SETTINGS ---
-        const TILE_SIZE = 40; // Pixels per tile
+        // --- GAME CONSTANTS (GRID LOGIC REMAINS FIXED) ---
         const MAP_SIZE = 20; // 20x20 tiles
-        const CANVAS_SIZE = MAP_SIZE * TILE_SIZE; // 800x800
-
         const LERP_FACTOR = 0.15; // Controls the speed of smooth movement
         const TRAIL_FADE_RATE = 0.05;
+        const SWING_DURATION = 300; // Duration of the swing animation in ms
 
         const CURRENCY_NAME = 'Gold';
         const STARTING_GOLD = 500;
+        const MEGA_GOLD_AMOUNT = 1000000; // New constant for the cheat amount
         
         // Weapon templates define base stats and repair cost
         const WEAPON_TEMPLATES = {
@@ -36,19 +35,17 @@
             'bow': { name: 'Advanced Bow', baseAttack: 4, baseDurability: 40, repairCost: 40 },
             'katana': { name: 'Samurai Katana', baseAttack: 6, baseDurability: 45, repairCost: 60 }
         };
-        // Multipliers for weapon scaling
         const DURABILITY_BONUS_PER_LEVEL = 25;
         const ATTACK_BONUS_PER_LEVEL = 3;
 
+        // Enemy Templates
+        const ENEMY_TEMPLATES = {
+            'weak_goblin': { name: 'Weak Goblin', maxHealth: 10, attack: 1, color: '#3c6e2b', killReward: 100 },
+        };
+
         // Tile IDs and their properties
         const TILE_TYPES = {
-            GRASS: 0,
-            WALL: 1,
-            WATER: 2,
-            ROAD: 3,
-            FOREST: 4,
-            BUILDING: 5, 
-            TREE: 6,      
+            GRASS: 0, WALL: 1, WATER: 2, ROAD: 3, FOREST: 4, BUILDING: 5, TREE: 6,      
         };
 
         const TILE_PROPERTIES = [
@@ -61,31 +58,45 @@
             { id: TILE_TYPES.TREE, name: 'Tree', color: '#004d40', traversable: false },         
         ];
 
-        // --- GAME STATE ---
+        // --- GAME STATE & DYNAMIC SIZING ---
         let db;
         let auth;
         let userId = null;
         let isAuthReady = false;
 
         let mapData = createEmptyMap(MAP_SIZE);
-        // Player state now includes currency and weapon
         let player = { 
-            x: 9, 
-            y: 9, 
-            visualX: 9, 
-            visualY: 9,
-            currency: 0, 
-            weapon: null 
+            x: 9, y: 9, visualX: 9, visualY: 9,
+            currency: 0, weapon: null 
         }; 
         let mode = 'play'; 
         let gameState = 'menu'; 
         
+        let enemies = []; 
+        let enemyAIInterval = null;
+
+        // Dynamic Sizing Variables (CRITICAL for responsiveness)
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas ? canvas.getContext('2d') : null;
+        let currentCanvasSize = 800; // Will be set on load/resize
+        let currentTilePixelSize = 40; // currentCanvasSize / MAP_SIZE
+
         // Animation state
         let isMoving = false; 
+        let isSwinging = false; 
         let animationFrameId = null; 
         let trailEffect = { x: -1, y: -1, opacity: 0 }; 
+        
+        // Utility for creating simple unique IDs
+        function simpleUUID() {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                var r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        }
 
-        // --- FIREBASE SETUP AND AUTHENTICATION (FIXED) ---
+
+        // --- FIREBASE SETUP & DATA HANDLING (Unchanged from working version) ---
 
         async function initFirebase() {
             try {
@@ -98,10 +109,9 @@
                 db = getFirestore(app);
                 auth = getAuth(app);
                 
-                // CRITICAL FIX: The listener must be set up *after* getAuth() has been called on the initialized app.
                 onAuthStateChanged(auth, (user) => {
                     if (user) {
-                        if (!userId) { // Prevents re-running startApp if already authenticated
+                        if (!userId) { 
                             userId = user.uid;
                             isAuthReady = true;
                             document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
@@ -116,11 +126,10 @@
                         }
                     } else {
                         console.log("No user signed in.");
-                        isAuthReady = true; // Mark as ready even if anonymous
+                        isAuthReady = true; 
                     }
                 });
 
-                // Sign in attempt (will trigger the onAuthStateChanged listener)
                 if (initialAuthToken) {
                     await signInWithCustomToken(auth, initialAuthToken);
                 } else {
@@ -133,61 +142,34 @@
             }
         }
 
-        // --- DATA PATH HELPERS ---
-
-        // Public path for the shared map data
         function getMapDocRef() {
             return doc(db, 'artifacts', appId, 'public', 'data', 'exploration_game', 'main_map');
         }
 
-        // Private path for the user's player state
         function getPlayerStateDocRef(uid) {
             return doc(db, 'artifacts', appId, 'users', uid, 'game_state', 'player_state');
         }
 
-        // --- WEAPON LOGIC ---
-
-        /**
-         * Initializes a new weapon object, setting base level.
-         * @param {string} type - The key from WEAPON_TEMPLATES.
-         * @returns {object} The initialized weapon object.
-         */
         function initializePlayerWeapon(type = 'sword') {
-            const newWeapon = {
-                type: type,
-                level: 1,
-                currentDurability: 0, // Will be set to max by calculateWeaponStats
-            };
+            const newWeapon = { type: type, level: 1, currentDurability: 0 };
             return calculateWeaponStats(newWeapon);
         }
 
-        /**
-         * Calculates max durability and attack based on weapon level.
-         * @param {object} weapon - The weapon state object.
-         * @returns {object} The updated weapon state object.
-         */
         function calculateWeaponStats(weapon) {
             const template = WEAPON_TEMPLATES[weapon.type];
             const level = weapon.level;
-
-            // Stats scale linearly with level
             const maxDurability = template.baseDurability + (level - 1) * DURABILITY_BONUS_PER_LEVEL;
             const attackPower = template.baseAttack + (level - 1) * ATTACK_BONUS_PER_LEVEL;
             
             weapon.maxDurability = maxDurability;
             weapon.attackPower = attackPower;
             
-            // If current durability is undefined (new object) or higher than new max (shouldn't happen), set to max.
             if (weapon.currentDurability === undefined || weapon.currentDurability > maxDurability) {
                 weapon.currentDurability = maxDurability;
             }
-
             return weapon;
         }
 
-        /**
-         * Attempts to upgrade the player's current weapon.
-         */
         function upgradeWeapon() {
             if (!player.weapon) return;
             if (player.weapon.currentDurability < player.weapon.maxDurability) {
@@ -196,7 +178,6 @@
             }
             
             const nextLevel = player.weapon.level + 1;
-            // Upgrade Cost: Base Repair Cost * (Level^2)
             const upgradeCost = WEAPON_TEMPLATES[player.weapon.type].repairCost * nextLevel * nextLevel; 
 
             if (player.currency < upgradeCost) {
@@ -207,7 +188,6 @@
             player.currency -= upgradeCost;
             player.weapon.level = nextLevel;
             
-            // Recalculate stats and set durability to new max
             player.weapon = calculateWeaponStats(player.weapon); 
             player.weapon.currentDurability = player.weapon.maxDurability;
 
@@ -216,9 +196,6 @@
             updateWeaponUI();
         }
 
-        /**
-         * Attempts to repair the player's current weapon to max durability.
-         */
         function repairWeapon() {
             if (!player.weapon) return;
             if (player.weapon.currentDurability === player.weapon.maxDurability) {
@@ -227,7 +204,6 @@
             }
 
             const missingDurability = player.weapon.maxDurability - player.weapon.currentDurability;
-            // Repair cost is 1 Gold per point of missing durability
             const repairCost = missingDurability * 1; 
 
             if (player.currency < repairCost) {
@@ -243,40 +219,161 @@
             updateWeaponUI();
         }
 
-        /**
-         * Mock function to simulate weapon usage and durability loss.
-         */
         function useWeapon() {
-            if (!player.weapon) return;
+            if (!player.weapon || isSwinging) return; 
+            
             if (player.weapon.currentDurability <= 0) {
                 document.getElementById('message-box').innerHTML = createMessage('warning', `Weapon is broken! Must be repaired.`);
                 return;
             }
             
-            // Randomly lose 1 to 5 durability
             const damage = Math.floor(Math.random() * 5) + 1;
             player.weapon.currentDurability = Math.max(0, player.weapon.currentDurability - damage);
 
-            document.getElementById('message-box').innerHTML = createMessage('info', `Weapon used (Damage: ${player.weapon.attackPower})! Durability lost: ${damage}.`);
-            
-            // If weapon breaks, notify user
+            const targetsHit = [];
+            const playerTileX = player.x;
+            const playerTileY = player.y;
+
+            for (let dy = -1; dy <= 1; dy++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                    const targetX = playerTileX + dx;
+                    const targetY = playerTileY + dy;
+                    
+                    if (targetX < 0 || targetX >= MAP_SIZE || targetY < 0 || targetY >= MAP_SIZE) continue;
+
+                    const hitEnemy = enemies.find(e => e.x === targetX && e.y === targetY);
+                    if (hitEnemy) {
+                        targetsHit.push(hitEnemy.id);
+                    }
+                }
+            }
+
+            let enemiesKilled = 0;
+            let message = `Swung sword! Durability lost: ${damage}.`;
+
+            if (targetsHit.length > 0) {
+                enemies = enemies.map(enemy => {
+                    if (targetsHit.includes(enemy.id)) {
+                        const damageDealt = player.weapon.attackPower;
+                        enemy.health -= damageDealt;
+                        
+                        if (enemy.health <= 0) {
+                            enemiesKilled++;
+                            player.currency += ENEMY_TEMPLATES[enemy.type].killReward; 
+                            return null; 
+                        }
+                    }
+                    return enemy;
+                }).filter(e => e !== null); 
+
+                message = `Swung sword! Hit ${targetsHit.length} target(s) for ${player.weapon.attackPower} damage each.`;
+                if (enemiesKilled > 0) {
+                    message += ` Killed ${enemiesKilled} Goblin(s)! Gained ${enemiesKilled * 100} ${CURRENCY_NAME}.`;
+                }
+                document.getElementById('message-box').innerHTML = createMessage('combat', message); 
+            } else {
+                document.getElementById('message-box').innerHTML = createMessage('info', `Swung sword! No enemies hit. ${message}`);
+            }
+
             if (player.weapon.currentDurability === 0) {
                 document.getElementById('message-box').innerHTML = createMessage('error', `Weapon BROKEN! Please repair it now.`);
             }
 
+            isSwinging = true;
+            const swordVisual = document.getElementById('swordVisual');
+            swordVisual.classList.add('swinging');
+            
+            setTimeout(() => {
+                swordVisual.classList.remove('swinging');
+                isSwinging = false;
+            }, SWING_DURATION);
+
+            saveMapToFirestore(mapData); 
             savePlayerState();
             updateWeaponUI();
         }
 
-        // --- MAP AND PLAYER MANAGEMENT ---
+        /**
+         * ADMIN/CHEAT FUNCTION: Grants 1,000,000 Gold only in Edit Mode.
+         */
+        function grantMegaGold() {
+            if (gameState !== 'game') {
+                document.getElementById('message-box').innerHTML = createMessage('warning', 'Game must be running to use this command.');
+                return;
+            }
+            if (mode === 'edit') {
+                player.currency += MEGA_GOLD_AMOUNT;
+                savePlayerState();
+                updateWeaponUI();
+                document.getElementById('message-box').innerHTML = createMessage('success', `ADMIN: Granted ${MEGA_GOLD_AMOUNT.toLocaleString()} ${CURRENCY_NAME}. Go buy some upgrades!`);
+            } else {
+                document.getElementById('message-box').innerHTML = createMessage('error', 'Cheat command failed. Must be in EDIT mode to use the ADMIN tools.');
+            }
+        }
+
+
+        function spawnInitialEnemies(count) {
+            const newEnemies = [];
+            const enemyTemplate = ENEMY_TEMPLATES['weak_goblin'];
+            for (let i = 0; i < count; i++) {
+                let x, y;
+                do {
+                    x = Math.floor(Math.random() * MAP_SIZE);
+                    y = Math.floor(Math.random() * MAP_SIZE);
+                } while (!isTileTraversable(x, y) || (x === player.x && y === player.y));
+
+                newEnemies.push({
+                    id: simpleUUID(),
+                    type: 'weak_goblin',
+                    x: x,
+                    y: y,
+                    health: enemyTemplate.maxHealth,
+                    maxHealth: enemyTemplate.maxHealth,
+                });
+            }
+            return newEnemies;
+        }
+
+        function startEnemyAI() {
+            stopEnemyAI();
+            enemyAIInterval = setInterval(() => {
+                if (gameState !== 'game' || mode !== 'play' || isSwinging) return;
+                
+                let moved = false;
+                enemies = enemies.map(enemy => {
+                    if (Math.random() < 0.1) {
+                        const dx = Math.floor(Math.random() * 3) - 1; 
+                        const dy = Math.floor(Math.random() * 3) - 1; 
+                        const newX = enemy.x + dx;
+                        const newY = enemy.y + dy;
+
+                        if (isTileTraversable(newX, newY) && !(newX === player.x && newY === player.y)) {
+                            enemy.x = newX;
+                            enemy.y = newY;
+                            moved = true;
+                        }
+                    }
+                    return enemy;
+                });
+                
+                if (moved) {
+                    drawGame(); 
+                    saveMapToFirestore(mapData);
+                }
+            }, 1000); 
+        }
+
+        function stopEnemyAI() {
+            if (enemyAIInterval) {
+                clearInterval(enemyAIInterval);
+                enemyAIInterval = null;
+            }
+        }
 
         function createEmptyMap(size) {
             return Array(size).fill(0).map(() => Array(size).fill(TILE_TYPES.GRASS));
         }
 
-        /**
-         * Generates a new, random map.
-         */
         function generateProceduralMap() {
             const newMap = createEmptyMap(MAP_SIZE);
             let riverY = Math.floor(MAP_SIZE * 0.3 + Math.random() * MAP_SIZE * 0.4); 
@@ -304,99 +401,86 @@
             }
             
             newMap[player.y][player.x] = TILE_TYPES.GRASS;
-
             return newMap;
         }
-
 
         function startListeners() {
             if (!isAuthReady || !userId || !db) return;
 
-            // 1. Listen for Map Data (Public)
             onSnapshot(getMapDocRef(), (docSnapshot) => {
+                let enemiesNeedSaving = false;
                 if (docSnapshot.exists()) {
                     const data = docSnapshot.data();
                     if (data.tiles) {
-                        try {
-                            mapData = JSON.parse(data.tiles); 
-                            console.log("Map data loaded/updated from Firestore.");
-                        } catch (e) {
+                        try { mapData = JSON.parse(data.tiles); } catch (e) {
                             console.error("Error parsing map data:", e);
                             document.getElementById('message-box').innerHTML = createMessage('error', 'Map data corruption detected. Resetting map.');
                             mapData = createEmptyMap(MAP_SIZE);
                         }
                     }
+                    if (data.enemies) { 
+                        try {
+                            const loadedEnemies = JSON.parse(data.enemies);
+                            enemies = loadedEnemies.map(e => ({ ...e, id: e.id || simpleUUID() }));
+                        } catch (e) {
+                            console.error("Error parsing enemies data:", e);
+                            document.getElementById('message-box').innerHTML = createMessage('error', 'Enemy data corruption detected. Resetting enemies.');
+                            enemies = [];
+                        }
+                    } else if (gameState === 'game' && enemies.length === 0) {
+                        enemies = spawnInitialEnemies(5);
+                        enemiesNeedSaving = true; 
+                    }
                 } else {
-                    console.log("No map data found. Initializing new map...");
-                    saveMapToFirestore(createEmptyMap(MAP_SIZE));
+                    mapData = createEmptyMap(MAP_SIZE);
+                    enemies = spawnInitialEnemies(5);
+                    enemiesNeedSaving = true;
                 }
+                if (enemiesNeedSaving) saveMapToFirestore(mapData);
             }, (error) => {
                 console.error("Error listening to map data:", error);
-                document.getElementById('message-box').innerHTML = createMessage('warning', 'Failed to load map data in real-time. Check console for details.');
             });
 
-            // 2. Listen for Player State (Private)
             onSnapshot(getPlayerStateDocRef(userId), (docSnapshot) => {
                 if (docSnapshot.exists()) {
                     const data = docSnapshot.data();
-                    
                     player.x = data.x ?? player.x;
                     player.y = data.y ?? player.y;
-                    
-                    // Load Currency
                     player.currency = data.currency ?? STARTING_GOLD; 
-                    
-                    // Load Weapon state
                     if (data.weapon) {
                         try {
-                            // Calculate stats based on level, then load current durability
                             const loadedWeapon = JSON.parse(data.weapon);
                             player.weapon = calculateWeaponStats(loadedWeapon);
                             player.weapon.currentDurability = loadedWeapon.currentDurability ?? player.weapon.maxDurability;
                         } catch (e) {
-                            console.error("Error parsing weapon data:", e);
                             player.weapon = initializePlayerWeapon();
                         }
                     } else {
                         player.weapon = initializePlayerWeapon();
                     }
-                    
-                    console.log(`Player state loaded/updated: (${player.x}, ${player.y})`);
-                    
                     if (gameState === 'game') {
                         updateWeaponUI();
-                        if (!animationFrameId) {
-                            animate();
-                        }
+                        if (!animationFrameId) animate();
                     }
                 } else {
-                    console.log("No player state found. Initializing state...");
                     player.currency = STARTING_GOLD;
                     player.weapon = initializePlayerWeapon();
                     savePlayerState();
                 }
             }, (error) => {
                 console.error("Error listening to player state:", error);
-                document.getElementById('message-box').innerHTML = createMessage('warning', 'Failed to load player state. Check console for details.');
             });
         }
 
         async function saveMapToFirestore(newMap = mapData) {
-            if (!isAuthReady || !userId || !db) {
-                document.getElementById('message-box').innerHTML = createMessage('error', 'Cannot save: Authentication not ready.');
-                return;
-            }
-
+            if (!isAuthReady || !userId || !db) return;
             try {
                 const serializedMap = JSON.stringify(newMap);
-
+                const serializedEnemies = JSON.stringify(enemies); 
                 await setDoc(getMapDocRef(), {
-                    tiles: serializedMap,
-                    last_updated: new Date().toISOString(),
-                    editor_id: userId
+                    tiles: serializedMap, enemies: serializedEnemies, last_updated: new Date().toISOString(), editor_id: userId
                 });
-                console.log("Map saved successfully!");
-                document.getElementById('message-box').innerHTML = createMessage('success', 'Map updated and saved.');
+                if (mode === 'edit') document.getElementById('message-box').innerHTML = createMessage('success', 'Map updated and saved.');
             } catch (error) {
                 console.error("Error saving map:", error);
                 document.getElementById('message-box').innerHTML = createMessage('error', `Save failed: ${error.message}`);
@@ -407,14 +491,9 @@
             if (!isAuthReady || !userId || !db) return;
             try {
                 await setDoc(getPlayerStateDocRef(userId), {
-                    x: player.x,
-                    y: player.y,
-                    currency: player.currency,
-                    // Save the weapon object (only the type, level, and currentDurability)
+                    x: player.x, y: player.y, currency: player.currency,
                     weapon: JSON.stringify({
-                        type: player.weapon.type,
-                        level: player.weapon.level,
-                        currentDurability: player.weapon.currentDurability
+                        type: player.weapon.type, level: player.weapon.level, currentDurability: player.weapon.currentDurability
                     }),
                     last_update: new Date().toISOString()
                 }, { merge: true });
@@ -423,16 +502,36 @@
             }
         }
 
-        // --- GAME CANVAS DRAWING & ANIMATION ---
-
-        const canvas = document.getElementById('gameCanvas');
-        const ctx = canvas.getContext('2d');
-
+        // --- RESIZING AND SCALING LOGIC (NEW) ---
+        
         /**
-         * Main animation loop.
+         * Dynamically adjusts canvas size based on its container, ensuring a square aspect ratio.
          */
+        function handleResize() {
+            const container = document.getElementById('game-container');
+            if (!container || !ctx) return;
+            
+            // Determine the maximum square size the container can hold
+            const size = container.clientWidth; 
+            
+            // Update the global dynamic size variables
+            currentCanvasSize = size;
+            currentTilePixelSize = currentCanvasSize / MAP_SIZE;
+
+            // Apply the new size to the canvas element
+            canvas.width = currentCanvasSize;
+            canvas.height = currentCanvasSize;
+            
+            // Redraw the game to fill the new dimensions
+            if (gameState === 'game') {
+                drawGame(); 
+            }
+        }
+        
+        // --- GAME CANVAS DRAWING & ANIMATION (SCALED) ---
+
         function animate() {
-            // 1. Interpolate visual position (Smooth Movement)
+            // Interpolate visual position (Smooth Movement)
             const targetX = player.x;
             const targetY = player.y;
 
@@ -449,19 +548,31 @@
                 isMoving = true;
             }
 
-            // 2. Fade out trail effect
+            // Update weapon visual position
+            const weaponVisual = document.getElementById('playerWeaponVisual');
+            if (weaponVisual && gameState === 'game' && mode === 'play') {
+                // Use SCALED position
+                const visualLeft = player.visualX * currentTilePixelSize + currentTilePixelSize / 2;
+                const visualTop = player.visualY * currentTilePixelSize + currentTilePixelSize / 2;
+                weaponVisual.style.transform = `translate(${visualLeft}px, ${visualTop}px)`;
+                weaponVisual.style.display = 'block';
+            } else if (weaponVisual) {
+                 weaponVisual.style.display = 'none';
+            }
+
+            // Fade out trail effect
             if (trailEffect.opacity > 0) {
                 trailEffect.opacity = Math.max(0, trailEffect.opacity - TRAIL_FADE_RATE);
             }
 
-            // 3. Redraw the entire game state
+            // Redraw the entire game state
             drawGame();
 
-            // 4. Loop: Continue if in game state or if movement/effects are ongoing
-            if (gameState === 'game' || isMoving || trailEffect.opacity > 0) {
+            // Loop: Continue if in game state or if movement/effects are ongoing
+            if (gameState === 'game' || isMoving || trailEffect.opacity > 0 || isSwinging) {
                 animationFrameId = requestAnimationFrame(animate);
             } else {
-                animationFrameId = null; // Stop loop when idle
+                animationFrameId = null; 
             }
         }
 
@@ -471,52 +582,36 @@
             let scaleFactor = 1.0;
             if (isMoving) {
                 const time = performance.now() * 0.005; 
-                // Subtle bobbing effect
                 scaleFactor = 1.0 + Math.abs(Math.sin(time * 5)) * 0.1; 
             }
 
-            const centerX = x * TILE_SIZE + TILE_SIZE / 2;
-            const centerY = y * TILE_SIZE + TILE_SIZE / 2;
+            const centerX = x * size + size / 2;
+            const centerY = y * size + size / 2;
             const headRadius = size / 3;
             const bodyHeight = size / 2;
 
-            ctx.shadowColor = 'transparent';
-            ctx.shadowBlur = 0;
-            ctx.shadowOffsetX = 0;
-            ctx.shadowOffsetY = 0;
-
-            // Apply scaling transform
             ctx.save();
             ctx.translate(centerX, centerY);
-            ctx.scale(scaleFactor, scaleFactor);
+            ctx.scale(scaleFactor * 0.9, scaleFactor * 0.9); 
             ctx.translate(-centerX, -centerY);
 
-
-            // 1. Head (Circle) - Duller color
+            // Head
             ctx.fillStyle = '#b7a288'; 
             ctx.beginPath();
             ctx.arc(centerX, centerY - headRadius / 2, headRadius, 0, Math.PI * 2);
             ctx.fill();
 
-            // 2. Body (Rectangle/Pants) - Grayish uniform
+            // Body
             ctx.fillStyle = '#787d83'; 
             ctx.fillRect(centerX - headRadius, centerY + headRadius * 0.5, headRadius * 2, bodyHeight);
             
-            ctx.restore(); // Restore transformation
-
-            ctx.shadowColor = 'transparent';
-            ctx.shadowBlur = 0;
-            ctx.shadowOffsetX = 0;
-            ctx.shadowOffsetY = 0;
+            ctx.restore(); 
         }
 
-        /**
-         * Draws a pseudo-3D tree tile.
-         */
         function drawTree(x, y) {
-            const startX = x * TILE_SIZE;
-            const startY = y * TILE_SIZE; 
-            const size = TILE_SIZE;
+            const size = currentTilePixelSize;
+            const startX = x * size;
+            const startY = y * size; 
 
             const baseGrassColor = TILE_PROPERTIES[TILE_TYPES.GRASS].color;
             const trunkColor = '#8d6e63'; 
@@ -540,7 +635,7 @@
             // Shadow Layer
             ctx.fillStyle = darkGreen;
             ctx.beginPath();
-            ctx.arc(centerX + 3, centerY + 5, canopyRadius, 0, Math.PI * 2);
+            ctx.arc(centerX + size * 0.075, centerY + size * 0.125, canopyRadius, 0, Math.PI * 2);
             ctx.fill();
 
             // Main Layer
@@ -552,27 +647,55 @@
             // Highlight Layer
             ctx.fillStyle = lightGreen;
             ctx.beginPath();
-            ctx.ellipse(centerX - 5, centerY - 5, canopyRadius * 0.7, canopyRadius * 0.6, 0, 0, Math.PI * 2);
+            ctx.ellipse(centerX - size * 0.125, centerY - size * 0.125, canopyRadius * 0.7, canopyRadius * 0.6, 0, 0, Math.PI * 2);
             ctx.fill();
             
             // Ground Shadow
             ctx.fillStyle = 'rgba(0,0,0,0.2)';
             ctx.beginPath();
-            ctx.ellipse(centerX, startY + size - 5, trunkWidth * 2, trunkWidth * 0.5, 0, 0, Math.PI * 2);
+            ctx.ellipse(centerX, startY + size - size * 0.125, trunkWidth * 2, trunkWidth * 0.5, 0, 0, Math.PI * 2);
             ctx.fill();
+        }
+        
+        function drawHealthBar(x, y, current, max) {
+            const tileP = currentTilePixelSize;
+            const startX = x * tileP;
+            const startY = y * tileP;
+            const barWidth = tileP * 0.75;
+            const barHeight = tileP * 0.1; 
+            const barX = startX + (tileP - barWidth) / 2;
+            const barY = startY - barHeight; 
+
+            const healthPct = current / max;
+            let color = 'red';
+            if (healthPct > 0.5) color = '#4ade80'; 
+            else if (healthPct > 0.2) color = '#facc15'; 
+
+            // Background bar
+            ctx.fillStyle = '#1f2937'; 
+            ctx.fillRect(barX, barY, barWidth, barHeight);
+
+            // Foreground health bar
+            ctx.fillStyle = color;
+            ctx.fillRect(barX, barY, barWidth * healthPct, barHeight);
+
+            // Border
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 0.5 * (currentCanvasSize / 800); // Scale border thickness
+            ctx.strokeRect(barX, barY, barWidth, barHeight);
         }
 
         function drawGame() {
-            canvas.width = CANVAS_SIZE;
-            canvas.height = CANVAS_SIZE;
+            if (!ctx) return;
+            const tileP = currentTilePixelSize;
 
-            // 0. Draw Fading Trail (Smooth Movement Effect)
+            // 0. Draw Fading Trail 
             if (trailEffect.opacity > 0) {
-                const trailX = trailEffect.x * TILE_SIZE + TILE_SIZE / 2;
-                const trailY = trailEffect.y * TILE_SIZE + TILE_SIZE / 2;
+                const trailX = trailEffect.x * tileP + tileP / 2;
+                const trailY = trailEffect.y * tileP + tileP / 2;
                 ctx.fillStyle = `rgba(255, 255, 255, ${trailEffect.opacity * 0.5})`; 
                 ctx.beginPath();
-                ctx.arc(trailX, trailY, TILE_SIZE * 0.4 * (1 + (1 - trailEffect.opacity)), 0, Math.PI * 2); 
+                ctx.arc(trailX, trailY, tileP * 0.4 * (1 + (1 - trailEffect.opacity)), 0, Math.PI * 2); 
                 ctx.fill();
             }
 
@@ -586,31 +709,52 @@
                         drawTree(x, y);
                     } else {
                         ctx.fillStyle = tile.color;
-                        ctx.fillRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+                        ctx.fillRect(x * tileP, y * tileP, tileP, tileP);
                     }
                     
                     ctx.strokeStyle = 'rgba(0, 0, 0, 0.1)';
-                    ctx.strokeRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+                    ctx.strokeRect(x * tileP, y * tileP, tileP, tileP);
 
                     if (mode === 'edit') {
                         ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
-                        ctx.strokeRect(x * TILE_SIZE, y * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+                        ctx.strokeRect(x * tileP, y * tileP, tileP, tileP);
                     }
                 }
             }
 
-            // 2. Draw the player
+            // 2. Draw Enemies
+            enemies.forEach(enemy => {
+                const template = ENEMY_TEMPLATES[enemy.type];
+                if (!template) return;
+
+                const centerX = enemy.x * tileP + tileP / 2;
+                const centerY = enemy.y * tileP + tileP / 2;
+                const size = tileP * 0.6; 
+
+                // Draw Goblin Body
+                ctx.fillStyle = template.color;
+                ctx.beginPath();
+                ctx.arc(centerX, centerY, size / 2, 0, Math.PI * 2);
+                ctx.fill();
+                
+                // Draw Health Bar
+                drawHealthBar(enemy.x, enemy.y, enemy.health, enemy.maxHealth);
+            });
+
+
+            // 3. Draw the player
             if (mode === 'play') {
-                drawAvatar(player.visualX, player.visualY, TILE_SIZE);
+                drawAvatar(player.visualX, player.visualY, tileP);
             }
 
-            // 3. Draw current mode indicator on canvas
+            // 4. Draw current mode indicator on canvas (Scaled text)
             ctx.fillStyle = mode === 'edit' ? 'rgba(255, 0, 0, 0.9)' : 'rgba(255, 255, 255, 0.9)';
-            ctx.font = '700 16px Inter, sans-serif';
-            ctx.fillText(mode.toUpperCase(), 10, 20);
+            const fontSize = Math.max(12, currentCanvasSize / 50); // Scale font size
+            ctx.font = `700 ${fontSize}px Inter, sans-serif`;
+            ctx.fillText(mode.toUpperCase(), currentCanvasSize * 0.0125, currentCanvasSize * 0.025);
         }
 
-        // --- MOVEMENT LOGIC (PLAY MODE) ---
+        // --- MOVEMENT & EDITOR LOGIC (SCALED INPUT) ---
 
         function isTileTraversable(x, y) {
             if (x < 0 || x >= MAP_SIZE || y < 0 || y >= MAP_SIZE) return false;
@@ -624,8 +768,9 @@
             
             const newX = player.x + dx;
             const newY = player.y + dy;
+            const hasEnemy = enemies.some(e => e.x === newX && e.y === newY);
 
-            if (isTileTraversable(newX, newY)) {
+            if (isTileTraversable(newX, newY) && !hasEnemy) {
                 trailEffect.x = player.x;
                 trailEffect.y = player.y;
                 trailEffect.opacity = 1.0;
@@ -634,27 +779,27 @@
                 player.y = newY;
 
                 savePlayerState(); 
+                if (!animationFrameId) animate();
 
-                if (!animationFrameId) {
-                    animate();
-                }
-
+            } else if (hasEnemy) {
+                document.getElementById('message-box').innerHTML = createMessage('info', 'Movement blocked by an enemy!');
             } else {
-                document.getElementById('message-box').innerHTML = createMessage('info', 'Movement blocked!');
+                 document.getElementById('message-box').innerHTML = createMessage('info', 'Movement blocked!');
             }
         }
-
-        // --- EDITOR LOGIC (EDIT MODE) ---
 
         function handleTileClick(event) {
             if (gameState !== 'game' || mode !== 'edit') return;
 
             const rect = canvas.getBoundingClientRect();
-            const scaleX = canvas.width / rect.width;
-            const scaleY = canvas.height / rect.height;
+            
+            // CRITICAL: Calculate clicks based on the current canvas size
+            const clickX = event.clientX - rect.left;
+            const clickY = event.clientY - rect.top;
 
-            const x = Math.floor(((event.clientX - rect.left) * scaleX) / TILE_SIZE);
-            const y = Math.floor(((event.clientY - rect.top) * scaleY) / TILE_SIZE);
+            // Map click coordinates to the 20x20 grid
+            const x = Math.floor(clickX / currentTilePixelSize);
+            const y = Math.floor(clickY / currentTilePixelSize);
 
             if (x >= 0 && x < MAP_SIZE && y >= 0 && y < MAP_SIZE) {
                 const currentTileId = mapData[y][x];
@@ -664,7 +809,6 @@
                 newMap[y][x] = nextTileId;
 
                 mapData = newMap;
-                
                 saveMapToFirestore(newMap);
             }
         }
@@ -674,18 +818,15 @@
         function updateWeaponUI() {
             if (!player.weapon) return;
             
-            // 1. Update Currency
-            document.getElementById('currency-display').textContent = `${CURRENCY_NAME}: ${player.currency} G`;
+            // Use toLocaleString for better formatting of large numbers
+            document.getElementById('currency-display').textContent = `${CURRENCY_NAME}: ${player.currency.toLocaleString()} G`;
 
-            // 2. Weapon Display
             const w = player.weapon;
             const template = WEAPON_TEMPLATES[w.type];
-            
             const missingDurability = w.maxDurability - w.currentDurability;
             const repairCost = missingDurability * 1; 
             const upgradeCost = template.repairCost * (w.level + 1) * (w.level + 1);
             
-            // Durability Bar Logic
             const durabilityPct = (w.currentDurability / w.maxDurability) * 100;
             let durabilityColor = 'bg-green-500';
             if (durabilityPct < 50) durabilityColor = 'bg-yellow-500';
@@ -705,26 +846,31 @@
             
             document.getElementById('weapon-display').innerHTML = weaponHtml;
 
-            // 3. Button Status and Text
             const repairBtn = document.getElementById('repair-btn');
             const upgradeBtn = document.getElementById('upgrade-btn');
 
             repairBtn.disabled = w.currentDurability === w.maxDurability || player.currency < repairCost;
             upgradeBtn.disabled = w.currentDurability !== w.maxDurability || player.currency < upgradeCost;
 
-            repairBtn.textContent = w.currentDurability === w.maxDurability ? 'Repaired (Full)' : `Repair (${repairCost} G)`;
-            upgradeBtn.textContent = `Upgrade (Lv.${w.level + 1} - ${upgradeCost} G)`;
+            repairBtn.textContent = w.currentDurability === w.maxDurability ? 'Repaired (Full)' : `Repair (${repairCost.toLocaleString()} G)`;
+            upgradeBtn.textContent = `Upgrade (Lv.${w.level + 1} - ${upgradeCost.toLocaleString()} G)`;
         }
 
 
         function startGame() {
             gameState = 'game';
             
-            const generatedMap = generateProceduralMap();
-            mapData = generatedMap; 
-            saveMapToFirestore(generatedMap); 
+            if (mapData.every(row => row.every(tile => tile === TILE_TYPES.GRASS))) {
+                 const generatedMap = generateProceduralMap();
+                 mapData = generatedMap; 
+            }
             
-            // Ensure player state is initialized if starting locally
+            if (enemies.length === 0) {
+                enemies = spawnInitialEnemies(5);
+            }
+            
+            saveMapToFirestore(mapData); 
+            
             player.currency = player.currency || STARTING_GOLD;
             player.weapon = player.weapon || initializePlayerWeapon();
             player.visualX = player.x;
@@ -732,15 +878,26 @@
 
             document.getElementById('app-content').classList.remove('hidden');
             document.getElementById('menu-screen').classList.add('hidden');
-            mode = 'play'; 
-            document.getElementById('mode-status').textContent = `Current Mode: ${mode.toUpperCase()}`;
-            document.getElementById('mode-toggle-btn').textContent = 'Switch to Edit Mode';
-            document.getElementById('edit-instruction').style.display = 'none';
-            document.getElementById('play-instruction').style.display = 'block';
             
-            updateWeaponUI(); // Initial UI draw
-            if (!animationFrameId) {
-                animate();
+            mode = 'play'; 
+            updateModeUI(); // Call new helper function to update all mode related UI
+            
+            updateWeaponUI(); 
+            startEnemyAI(); 
+            if (!animationFrameId) animate();
+            handleResize(); // Initial resize call after starting game
+        }
+
+        function updateModeUI() {
+            document.getElementById('mode-status').textContent = `Current Mode: ${mode.toUpperCase()}`;
+            document.getElementById('mode-toggle-btn').textContent = mode === 'play' ? 'Switch to Edit Mode' : 'Switch to Play Mode';
+            document.getElementById('edit-instruction').style.display = mode === 'edit' ? 'block' : 'none';
+            document.getElementById('play-instruction').style.display = mode === 'play' ? 'block' : 'none';
+            
+            // Show/Hide admin button based on mode
+            const megaGoldBtn = document.getElementById('mega-gold-btn');
+            if(megaGoldBtn) {
+                megaGoldBtn.style.display = mode === 'edit' ? 'block' : 'none';
             }
         }
 
@@ -748,20 +905,24 @@
             if (gameState !== 'game') return;
 
             mode = mode === 'play' ? 'edit' : 'play';
-            document.getElementById('mode-toggle-btn').textContent = mode === 'play' ? 'Switch to Edit Mode' : 'Switch to Play Mode';
-            document.getElementById('mode-status').textContent = `Current Mode: ${mode.toUpperCase()}`;
-            document.getElementById('edit-instruction').style.display = mode === 'edit' ? 'block' : 'none';
-            document.getElementById('play-instruction').style.display = mode === 'play' ? 'block' : 'none';
+            updateModeUI();
             document.getElementById('message-box').innerHTML = createMessage('info', `Switched to ${mode.toUpperCase()} Mode.`);
             
-            if (!animationFrameId) {
-                animate();
-            }
+            if (!animationFrameId) animate();
         }
 
         // --- UI & EVENT HANDLERS ---
         
         function initializeView() {
+            // Setup ResizeObserver to handle screen/container changes
+            const observer = new ResizeObserver(() => {
+                handleResize();
+            });
+            const gameContainer = document.getElementById('game-container');
+            if(gameContainer) {
+                observer.observe(gameContainer);
+            }
+            
             if (gameState === 'menu') {
                 document.getElementById('app-content').classList.add('hidden');
                 document.getElementById('menu-screen').classList.remove('hidden');
@@ -769,28 +930,33 @@
                 document.getElementById('app-content').classList.remove('hidden');
                 document.getElementById('menu-screen').classList.add('hidden');
             }
+            // Initial call to set canvas size correctly
+            handleResize(); 
         }
 
         document.addEventListener('keydown', (e) => {
             if (mode === 'play') {
-                if (isMoving) return; 
+                if (isMoving && e.key !== 'z' && e.key !== 'Z') return; 
 
-                switch (e.key) {
-                    case 'ArrowUp':
+                switch (e.key.toLowerCase()) {
+                    case 'arrowup':
                     case 'w':
                         movePlayer(0, -1);
                         break;
-                    case 'ArrowDown':
+                    case 'arrowdown':
                     case 's':
                         movePlayer(0, 1);
                         break;
-                    case 'ArrowLeft':
+                    case 'arrowleft':
                     case 'a':
                         movePlayer(-1, 0);
                         break;
-                    case 'ArrowRight':
+                    case 'arrowright':
                     case 'd':
                         movePlayer(1, 0);
+                        break;
+                    case 'z': 
+                        useWeapon();
                         break;
                     default:
                         return;
@@ -799,14 +965,15 @@
             }
         });
 
-        canvas.addEventListener('click', handleTileClick);
+        if (canvas) canvas.addEventListener('click', handleTileClick);
         
-        // Add new button handlers
         document.getElementById('mode-toggle-btn').addEventListener('click', toggleMode);
         document.getElementById('play-game-btn').addEventListener('click', startGame);
         document.getElementById('repair-btn').addEventListener('click', repairWeapon);
         document.getElementById('upgrade-btn').addEventListener('click', upgradeWeapon);
         document.getElementById('use-weapon-btn').addEventListener('click', useWeapon);
+        // New event listener for the cheat button
+        document.getElementById('mega-gold-btn').addEventListener('click', grantMegaGold);
 
         function createMessage(type, content) {
             const baseClasses = 'p-3 rounded-lg text-sm transition-all duration-300';
@@ -822,6 +989,9 @@
                 case 'warning':
                     classes = 'bg-yellow-100 text-yellow-800';
                     break;
+                case 'combat': 
+                    classes = 'bg-red-50 text-red-700 border-l-4 border-red-400 font-semibold';
+                    break;
                 case 'info':
                 default:
                     classes = 'bg-blue-100 text-blue-800';
@@ -834,11 +1004,9 @@
         // --- INITIALIZATION ---
 
         window.onload = () => {
-            canvas.width = CANVAS_SIZE;
-            canvas.height = CANVAS_SIZE;
             initFirebase();
             initializeView(); 
-            drawGame(); 
+            // drawGame is called inside handleResize
         };
 
     </script>
@@ -846,11 +1014,23 @@
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
         @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
         
-        body {
+        /* Ensure body and html take full height and remove padding for clean fullscreen overlay */
+        html, body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
             font-family: 'Inter', sans-serif;
             background-color: #f7f9fb;
-            position: relative; 
         }
+
+        /* Responsive Canvas Container */
+        #game-container {
+            position: relative; 
+            width: 100%; /* Take full width of parent */
+            aspect-ratio: 1 / 1; /* Maintain a 1:1 square ratio */
+            max-width: 800px; /* Cap the max size on very large screens */
+        }
+        
         #gameCanvas {
             background-color: #333;
             border: 4px solid #1a202c;
@@ -858,57 +1038,134 @@
             box-shadow: 0 10px 15px rgba(0, 0, 0, 0.2);
             touch-action: none; 
             filter: grayscale(30%) saturate(80%) hue-rotate(-10deg); 
+            /* CRITICAL: Canvas style to fill 100% of the dynamically sized container */
+            width: 100%;
+            height: 100%;
         }
+
+        /* --- SWORD VISUAL STYLES --- */
+        #playerWeaponVisual {
+            position: absolute;
+            top: 0;
+            left: 0;
+            transform-origin: 0 0; 
+            pointer-events: none; 
+            z-index: 10;
+            transition: transform 0.1s linear; 
+        }
+
+        .sword-blade {
+            width: 6px;
+            height: 30px; 
+            background-color: #d1d5db; 
+            position: absolute;
+            bottom: 0;
+            left: -3px; 
+            border-radius: 2px 2px 0 0;
+            box-shadow: 0 0 5px rgba(255, 255, 255, 0.5);
+            transform: rotate(45deg); 
+            transform-origin: 0 0; 
+        }
+
+        .sword-blade::after {
+            content: '';
+            position: absolute;
+            top: 28px; 
+            left: -4px; 
+            width: 14px;
+            height: 4px;
+            background-color: #7b3f00; 
+            border-radius: 1px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+        }
+
+        @keyframes sword-swing {
+            0% { transform: rotate(45deg); }
+            50% { transform: rotate(225deg) scale(1.1); } 
+            100% { transform: rotate(45deg); }
+        }
+
+        .swinging {
+            animation: sword-swing 0.3s ease-out;
+        }
+        /* --- END SWORD VISUAL STYLES --- */
+
         .control-panel {
             background-color: #ffffff;
             border-radius: 12px;
             box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
         }
 
-        /* --- MENU STYLING --- */
+        /* --- COOLER MENU STYLING --- */
+
+        /* Animated Title Glow */
+        @keyframes title-flicker {
+            0%, 18%, 22%, 25%, 53%, 57%, 100% {
+                text-shadow: 
+                    0 0 7px rgba(255, 255, 255, 0.8),
+                    0 0 10px rgba(255, 255, 255, 0.6),
+                    0 0 20px rgba(100, 200, 255, 0.4),
+                    0 0 30px rgba(100, 200, 255, 0.3);
+                opacity: 1;
+            }
+            20%, 24%, 55% {        
+                text-shadow: none;
+                opacity: 0.8;
+            }
+        }
+
+        /* Menu Background with Texture and Vignette */
         #menu-screen {
-            background-image: repeating-linear-gradient(
-                -45deg,
-                rgba(0, 0, 0, 0.2) 0,
-                rgba(0, 0, 0, 0.2) 1px,
-                transparent 1px,
-                transparent 50px
+            /* Deep, dark background color */
+            background-color: #1c1c1c; 
+            /* Subtle texture overlay for a stone/dungeon look */
+            background-image: radial-gradient(circle at center, rgba(0, 0, 0, 0) 0%, rgba(0, 0, 0, 0.8) 100%),
+                              repeating-linear-gradient(
+                45deg, rgba(50, 50, 50, 0.1) 0, rgba(50, 50, 50, 0.1) 1px, transparent 1px, transparent 100px
             );
-            background-color: #1a202c;
         }
 
         #menu-title {
             font-family: 'Press Start 2P', cursive;
-            color: white;
-            text-shadow: 4px 4px #4a6b2c; 
+            color: #d1d5db; /* Light gray for the base */
             letter-spacing: 5px;
-            margin-bottom: 2rem;
+            animation: title-flicker 4s infinite alternate; /* Apply the flicker animation */
+        }
+        
+        /* Stylized Compass Icon Animation */
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+        .spinning-icon {
+            animation: spin 30s linear infinite;
         }
 
+        /* Improved Button Styling */
         .menu-button {
             padding: 1rem 3rem;
-            background-color: #689f38; 
-            border: 4px solid #385e1c;
-            color: #fff;
+            background-color: #a8a29e; /* Stone/Metal color */
+            border: 4px solid #44403c; /* Dark border */
+            color: #1c1c1c;
             font-weight: bold;
-            font-family: 'Inter', sans-serif;
-            text-shadow: 1px 1px #333;
-            box-shadow: 0 4px 0 #385e1c, 0 6px 10px rgba(0,0,0,0.5);
-            transition: transform 0.1s, background-color 0.1s;
+            font-family: 'Press Start 2P', cursive; /* Use game font for button */
+            text-shadow: 1px 1px #e5e7eb;
+            box-shadow: 0 6px 0 #44403c, 0 10px 20px rgba(0,0,0,0.6);
+            transition: transform 0.1s, background-color 0.1s, box-shadow 0.1s;
         }
 
         .menu-button:hover {
-            background-color: #8bc34a; 
-            transform: translateY(-2px);
-            box-shadow: 0 6px 0 #385e1c, 0 8px 15px rgba(0,0,0,0.6);
+            background-color: #c0b9b3; 
+            transform: translateY(-4px);
+            box-shadow: 0 8px 0 #44403c, 0 12px 25px rgba(0,0,0,0.8);
         }
 
         .menu-button:active {
             transform: translateY(2px);
-            box-shadow: 0 2px 0 #385e1c;
+            box-shadow: 0 2px 0 #44403c;
         }
-        
-        /* Disabled button style */
+        /* --- END COOLER MENU STYLING --- */
+
         button:disabled {
             opacity: 0.5;
             cursor: not-allowed;
@@ -917,31 +1174,53 @@
         }
     </style>
 </head>
-<body class="p-4 md:p-8 min-h-screen flex items-start justify-center">
+<body class="min-h-screen flex items-start justify-center p-2 sm:p-4">
 
     <!-- Main Menu Screen Overlay -->
-    <div id="menu-screen" class="absolute inset-0 z-50 flex flex-col items-center justify-center hidden">
-        <h1 id="menu-title" class="text-4xl sm:text-6xl">2D EXPLORER</h1>
-        <button id="play-game-btn" class="menu-button rounded-md mt-8">
-            PLAY
+    <div id="menu-screen" class="fixed inset-0 z-50 flex flex-col items-center justify-center hidden">
+        
+        <!-- Stylized Icon/Graphic -->
+        <svg class="w-20 h-20 mb-6 text-yellow-500 spinning-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 2v2m0 16v2M4 12H2m20 0h-2M6.34 6.34l1.42 1.42M16.24 16.24l1.42 1.42M6.34 17.66l1.42-1.42M16.24 7.76l1.42-1.42"></path>
+        </svg>
+
+        <h1 id="menu-title" class="text-3xl sm:text-5xl lg:text-6xl text-center">2D EXPLORER</h1>
+        
+        <p class="mt-4 text-gray-400 text-sm italic font-semibold">
+            The Collaborative Map Dungeon
+        </p>
+
+        <button id="play-game-btn" class="menu-button rounded-lg mt-12">
+            START QUEST
         </button>
-        <p class="mt-12 text-gray-400 text-sm italic">
-            A Collaborative 2D Map Editor
+        
+        <p class="mt-12 text-gray-500 text-xs italic">
+            Created by the Dungeon Master (Your ID is used for saving.)
         </p>
     </div>
 
-    <!-- Existing Game Content Container -->
-    <div id="app-content" class="flex flex-col lg:flex-row gap-8 w-full max-w-7xl">
+    <!-- Existing Game Content Container - Now fully responsive -->
+    <div id="app-content" class="flex flex-col lg:flex-row gap-4 sm:gap-8 w-full max-w-7xl">
         
-        <!-- Game Canvas Area -->
-        <div class="flex flex-col items-center justify-center lg:flex-1">
-            <h1 class="text-3xl font-bold text-gray-800 mb-4">The Explorer's Canvas</h1>
-            <canvas id="gameCanvas" width="800" height="800"></canvas>
+        <!-- Game Canvas Area - Takes up available space -->
+        <div class="flex flex-col items-center justify-center lg:flex-1 w-full">
+            <h1 class="text-xl sm:text-3xl font-bold text-gray-800 mb-4 text-center">The Explorer's Canvas</h1>
+            
+            <!-- Game Container is constrained to maintain 1:1 aspect ratio -->
+            <div id="game-container" class="relative">
+                <!-- Canvas has no fixed size here, it gets set by JS (handleResize) -->
+                <canvas id="gameCanvas"></canvas>
+                
+                <div id="playerWeaponVisual" style="display: none;">
+                    <div id="swordVisual" class="sword-blade"></div>
+                </div>
+            </div>
         </div>
 
-        <!-- Control Panel -->
-        <div class="control-panel p-6 lg:w-96">
-            <h2 class="text-2xl font-bold text-gray-700 mb-4 border-b pb-2">Admin Tools & Progression</h2>
+        <!-- Control Panel - Width adapts on smaller screens -->
+        <div class="control-panel p-4 sm:p-6 lg:w-96 w-full mt-4 lg:mt-0">
+            <h2 class="text-xl sm:text-2xl font-bold text-gray-700 mb-4 border-b pb-2">Admin Tools & Progression</h2>
             
             <div class="space-y-4">
                 
@@ -950,19 +1229,23 @@
                 <button id="mode-toggle-btn" class="w-full py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg shadow-md transition duration-150 ease-in-out transform hover:scale-[1.02]">
                     Switch to Edit Mode
                 </button>
+                
+                <!-- NEW ADMIN BUTTON for 1M Gold, initially hidden in Play Mode -->
+                <button id="mega-gold-btn" class="w-full py-2 px-4 bg-red-800 hover:bg-red-700 text-white font-bold rounded-lg shadow-md transition duration-150 ease-in-out text-sm" style="display: none;">
+                    ADMIN: Grant 1,000,000 Gold
+                </button>
 
                 <div id="message-box" class="min-h-[40px] mt-4">
                     <div class="p-3 rounded-lg text-sm bg-blue-100 text-blue-800 shadow-md">Loading game data...</div>
                 </div>
 
-                <!-- NEW: Weapon Station -->
+                <!-- Weapon Station -->
                 <div class="border-t pt-4">
                     <h3 class="text-xl font-bold text-gray-700 mb-2">Weapon Station</h3>
                     <p id="currency-display" class="text-lg font-semibold text-yellow-700 mb-4">Gold: 0</p>
                     
                     <!-- Weapon Display -->
                     <div id="weapon-display" class="bg-gray-100 p-3 rounded-lg space-y-2 border border-gray-300">
-                        <!-- Weapon details inserted by JS -->
                         <p class="text-sm text-gray-500">Weapon loading...</p>
                     </div>
 
@@ -976,7 +1259,7 @@
                         </button>
                     </div>
                     <button id="use-weapon-btn" class="w-full mt-2 py-2 bg-gray-700 hover:bg-gray-600 text-white font-bold rounded-lg transition">
-                        Use Weapon (Mock Combat)
+                        Use Weapon (Z key)
                     </button>
                 </div>
 
@@ -987,23 +1270,23 @@
                     <div id="play-instruction" class="space-y-2 text-sm text-gray-600">
                         <p class="font-semibold text-green-700">Play Mode:</p>
                         <ul class="list-disc list-inside ml-2">
-                            <li>Use **WASD** or **Arrow Keys** to move smoothly.</li>
-                            <li>Use the **Weapon Station** to manage your gear!</li>
+                            <li>Use **WASD** or **Arrow Keys** to move.</li>
+                            <li>Press **Z** or click **Use Weapon** to swing the sword and attack goblins!</li>
                         </ul>
                     </div>
                     
                     <div id="edit-instruction" class="space-y-2 text-sm text-gray-600 hidden">
                         <p class="font-semibold text-red-700">Edit Mode (Admin):</p>
                         <ul class="list-disc list-inside ml-2">
-                            <li>Click on any tile to cycle through tile types (Grass, Wall, Water, etc.).</li>
-                            <li>The map is shared and **saved instantly** to Firestore!</li>
+                            <li>Click on any tile to cycle through tile types.</li>
+                            <li>Use the **ADMIN button** above to get instant gold for testing upgrades!</li>
                         </ul>
                     </div>
                 </div>
 
                 <div class="border-t pt-4 mt-4">
                     <p id="user-id-display" class="text-xs text-gray-400">User ID: Loading...</p>
-                    <p class="text-xs text-gray-400">Map Data is Public/Shared.</p>
+                    <p class="text-xs text-gray-400">Map Data and Enemy state are Public/Shared.</p>
                     <p class="text-xs text-gray-400">Player Data (Gold/Weapon) is Private.</p>
                 </div>
             </div>
