@@ -19,7 +19,7 @@
         const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
-        // --- GAME CONSTANTS (GRID LOGIC REMAINS FIXED) ---
+        // --- GAME CONSTANTS ---
         const MAP_SIZE = 20; // 20x20 tiles
         const LERP_FACTOR = 0.15; // Controls the speed of smooth movement
         const TRAIL_FADE_RATE = 0.05;
@@ -27,7 +27,15 @@
 
         const CURRENCY_NAME = 'Gold';
         const STARTING_GOLD = 500;
-        const MEGA_GOLD_AMOUNT = 1000000; // New constant for the cheat amount
+        const MEGA_GOLD_AMOUNT = 1000000; 
+
+        // New Player Stat Constants
+        const STARTING_HEALTH = 100;
+        const STARTING_STAMINA = 100;
+        const SWING_STAMINA_COST = 20;
+        const STAMINA_REGEN_RATE = 2.0; // points per frame while idle (higher for quicker test)
+        const ENEMY_ATTACK_RANGE = 1; // Enemies attack when 1 tile away
+
         
         // Weapon templates define base stats and repair cost
         const WEAPON_TEMPLATES = {
@@ -38,9 +46,9 @@
         const DURABILITY_BONUS_PER_LEVEL = 25;
         const ATTACK_BONUS_PER_LEVEL = 3;
 
-        // Enemy Templates
+        // Enemy Templates - Added attack power
         const ENEMY_TEMPLATES = {
-            'weak_goblin': { name: 'Weak Goblin', maxHealth: 10, attack: 1, color: '#3c6e2b', killReward: 100 },
+            'weak_goblin': { name: 'Weak Goblin', maxHealth: 10, attack: 5, color: '#3c6e2b', killReward: 100 },
         };
 
         // Tile IDs and their properties
@@ -67,10 +75,15 @@
         let mapData = createEmptyMap(MAP_SIZE);
         let player = { 
             x: 9, y: 9, visualX: 9, visualY: 9,
-            currency: 0, weapon: null 
+            currency: 0, weapon: null,
+            // New player stats
+            maxHealth: STARTING_HEALTH,
+            currentHealth: STARTING_HEALTH,
+            maxStamina: STARTING_STAMINA,
+            currentStamina: STARTING_STAMINA
         }; 
         let mode = 'play'; 
-        let gameState = 'menu'; 
+        let gameState = 'menu'; // menu, game, game_over
         
         let enemies = []; 
         let enemyAIInterval = null;
@@ -78,8 +91,8 @@
         // Dynamic Sizing Variables (CRITICAL for responsiveness)
         const canvas = document.getElementById('gameCanvas');
         const ctx = canvas ? canvas.getContext('2d') : null;
-        let currentCanvasSize = 800; // Will be set on load/resize
-        let currentTilePixelSize = 40; // currentCanvasSize / MAP_SIZE
+        let currentCanvasSize = 800; 
+        let currentTilePixelSize = 40; 
 
         // Animation state
         let isMoving = false; 
@@ -96,7 +109,7 @@
         }
 
 
-        // --- FIREBASE SETUP & DATA HANDLING (Unchanged from working version) ---
+        // --- FIREBASE SETUP & DATA HANDLING ---
 
         async function initFirebase() {
             try {
@@ -191,9 +204,9 @@
             player.weapon = calculateWeaponStats(player.weapon); 
             player.weapon.currentDurability = player.weapon.maxDurability;
 
-            document.getElementById('message-box').innerHTML = createMessage('success', `Weapon upgraded to Level ${nextLevel}! Cost: ${upgradeCost} ${CURRENCY_NAME}.`);
+            document.getElementById('message-box').innerHTML = createMessage('success', `Weapon upgraded to Level ${nextLevel}! Cost: ${upgradeCost.toLocaleString()} ${CURRENCY_NAME}.`);
             savePlayerState();
-            updateWeaponUI();
+            updateStatusUI();
         }
 
         function repairWeapon() {
@@ -207,26 +220,36 @@
             const repairCost = missingDurability * 1; 
 
             if (player.currency < repairCost) {
-                document.getElementById('message-box').innerHTML = createMessage('error', `Not enough ${CURRENCY_NAME}! Requires ${repairCost} to fully repair.`);
+                document.getElementById('message-box').innerHTML = createMessage('error', `Not enough ${CURRENCY_NAME}! Requires ${repairCost.toLocaleString()} to fully repair.`);
                 return;
             }
 
             player.currency -= repairCost;
             player.weapon.currentDurability = player.weapon.maxDurability;
 
-            document.getElementById('message-box').innerHTML = createMessage('success', `Weapon fully repaired! Cost: ${repairCost} ${CURRENCY_NAME}.`);
+            document.getElementById('message-box').innerHTML = createMessage('success', `Weapon fully repaired! Cost: ${repairCost.toLocaleString()} ${CURRENCY_NAME}.`);
             savePlayerState();
-            updateWeaponUI();
+            updateStatusUI();
         }
 
         function useWeapon() {
+            if (gameState !== 'game' || mode !== 'play') return;
             if (!player.weapon || isSwinging) return; 
             
             if (player.weapon.currentDurability <= 0) {
                 document.getElementById('message-box').innerHTML = createMessage('warning', `Weapon is broken! Must be repaired.`);
                 return;
             }
+
+            if (player.currentStamina < SWING_STAMINA_COST) {
+                document.getElementById('message-box').innerHTML = createMessage('warning', `Not enough Stamina! Requires ${SWING_STAMINA_COST}.`);
+                return;
+            }
             
+            // Consume Stamina
+            player.currentStamina = Math.max(0, player.currentStamina - SWING_STAMINA_COST);
+
+            // Consume Durability
             const damage = Math.floor(Math.random() * 5) + 1;
             player.weapon.currentDurability = Math.max(0, player.weapon.currentDurability - damage);
 
@@ -249,7 +272,7 @@
             }
 
             let enemiesKilled = 0;
-            let message = `Swung sword! Durability lost: ${damage}.`;
+            let message = `Swung sword! Stamina: -${SWING_STAMINA_COST}. Durability lost: ${damage}.`;
 
             if (targetsHit.length > 0) {
                 enemies = enemies.map(enemy => {
@@ -290,7 +313,8 @@
 
             saveMapToFirestore(mapData); 
             savePlayerState();
-            updateWeaponUI();
+            updateStatusUI();
+            drawGame(); // Ensure enemy health bars update immediately
         }
 
         /**
@@ -304,7 +328,7 @@
             if (mode === 'edit') {
                 player.currency += MEGA_GOLD_AMOUNT;
                 savePlayerState();
-                updateWeaponUI();
+                updateStatusUI();
                 document.getElementById('message-box').innerHTML = createMessage('success', `ADMIN: Granted ${MEGA_GOLD_AMOUNT.toLocaleString()} ${CURRENCY_NAME}. Go buy some upgrades!`);
             } else {
                 document.getElementById('message-box').innerHTML = createMessage('error', 'Cheat command failed. Must be in EDIT mode to use the ADMIN tools.');
@@ -340,8 +364,21 @@
                 if (gameState !== 'game' || mode !== 'play' || isSwinging) return;
                 
                 let moved = false;
+                let attacked = false;
+
                 enemies = enemies.map(enemy => {
-                    if (Math.random() < 0.1) {
+                    const template = ENEMY_TEMPLATES[enemy.type];
+                    const distance = Math.abs(enemy.x - player.x) + Math.abs(enemy.y - player.y);
+                    
+                    if (distance <= ENEMY_ATTACK_RANGE) {
+                        // Enemy attacks the player
+                        player.currentHealth = Math.max(0, player.currentHealth - template.attack);
+                        document.getElementById('message-box').innerHTML = createMessage('combat', `${template.name} attacked! Player took ${template.attack} damage.`);
+                        attacked = true;
+                        // Prevent movement if attacking
+                        return enemy; 
+                    } else if (Math.random() < 0.1) {
+                        // Enemy moves randomly
                         const dx = Math.floor(Math.random() * 3) - 1; 
                         const dy = Math.floor(Math.random() * 3) - 1; 
                         const newX = enemy.x + dx;
@@ -356,11 +393,23 @@
                     return enemy;
                 });
                 
-                if (moved) {
+                if (attacked) {
+                    if (player.currentHealth <= 0) {
+                        // GAME OVER LOGIC
+                        gameState = 'game_over';
+                        stopEnemyAI();
+                        document.getElementById('game-over-screen').classList.remove('hidden');
+                        document.getElementById('app-content').classList.add('hidden');
+                    }
+                    savePlayerState();
+                    updateStatusUI(); 
+                }
+
+                if (moved || attacked) {
                     drawGame(); 
                     saveMapToFirestore(mapData);
                 }
-            }, 1000); 
+            }, 1000); // Enemy action every second
         }
 
         function stopEnemyAI() {
@@ -421,7 +470,7 @@
                     if (data.enemies) { 
                         try {
                             const loadedEnemies = JSON.parse(data.enemies);
-                            enemies = loadedEnemies.map(e => ({ ...e, id: e.id || simpleUUID() }));
+                            enemies = loadedEnemies.map(e => ({ ...e, id: e.id || simpleUUID(), maxHealth: ENEMY_TEMPLATES[e.type]?.maxHealth || 10 }));
                         } catch (e) {
                             console.error("Error parsing enemies data:", e);
                             document.getElementById('message-box').innerHTML = createMessage('error', 'Enemy data corruption detected. Resetting enemies.');
@@ -447,6 +496,12 @@
                     player.x = data.x ?? player.x;
                     player.y = data.y ?? player.y;
                     player.currency = data.currency ?? STARTING_GOLD; 
+                    // Load new stats, fallback to constants
+                    player.maxHealth = data.maxHealth ?? STARTING_HEALTH;
+                    player.currentHealth = data.currentHealth ?? STARTING_HEALTH;
+                    player.maxStamina = data.maxStamina ?? STARTING_STAMINA;
+                    player.currentStamina = data.currentStamina ?? STARTING_STAMINA;
+
                     if (data.weapon) {
                         try {
                             const loadedWeapon = JSON.parse(data.weapon);
@@ -459,12 +514,14 @@
                         player.weapon = initializePlayerWeapon();
                     }
                     if (gameState === 'game') {
-                        updateWeaponUI();
+                        updateStatusUI();
                         if (!animationFrameId) animate();
                     }
                 } else {
                     player.currency = STARTING_GOLD;
                     player.weapon = initializePlayerWeapon();
+                    player.currentHealth = STARTING_HEALTH;
+                    player.currentStamina = STARTING_STAMINA;
                     savePlayerState();
                 }
             }, (error) => {
@@ -492,6 +549,8 @@
             try {
                 await setDoc(getPlayerStateDocRef(userId), {
                     x: player.x, y: player.y, currency: player.currency,
+                    currentHealth: player.currentHealth, maxHealth: player.maxHealth,
+                    currentStamina: player.currentStamina, maxStamina: player.maxStamina,
                     weapon: JSON.stringify({
                         type: player.weapon.type, level: player.weapon.level, currentDurability: player.weapon.currentDurability
                     }),
@@ -502,7 +561,7 @@
             }
         }
 
-        // --- RESIZING AND SCALING LOGIC (NEW) ---
+        // --- RESIZING AND SCALING LOGIC ---
         
         /**
          * Dynamically adjusts canvas size based on its container, ensuring a square aspect ratio.
@@ -511,26 +570,30 @@
             const container = document.getElementById('game-container');
             if (!container || !ctx) return;
             
-            // Determine the maximum square size the container can hold
             const size = container.clientWidth; 
             
-            // Update the global dynamic size variables
             currentCanvasSize = size;
             currentTilePixelSize = currentCanvasSize / MAP_SIZE;
 
-            // Apply the new size to the canvas element
             canvas.width = currentCanvasSize;
             canvas.height = currentCanvasSize;
             
-            // Redraw the game to fill the new dimensions
             if (gameState === 'game') {
                 drawGame(); 
             }
         }
         
-        // --- GAME CANVAS DRAWING & ANIMATION (SCALED) ---
+        // --- GAME CANVAS DRAWING & ANIMATION ---
 
         function animate() {
+            // Check for Game Over state first
+            if (gameState === 'game_over') {
+                stopEnemyAI();
+                if (animationFrameId) cancelAnimationFrame(animationFrameId);
+                animationFrameId = null;
+                return;
+            }
+
             // Interpolate visual position (Smooth Movement)
             const targetX = player.x;
             const targetY = player.y;
@@ -548,10 +611,16 @@
                 isMoving = true;
             }
 
+            // Stamina Regeneration (Only when not swinging/moving and in play mode)
+            if (mode === 'play' && !isSwinging && !isMoving && player.currentStamina < player.maxStamina) {
+                 const newStamina = player.currentStamina + STAMINA_REGEN_RATE;
+                 player.currentStamina = Math.min(player.maxStamina, newStamina);
+                 updateStatusUI(); 
+            }
+
             // Update weapon visual position
             const weaponVisual = document.getElementById('playerWeaponVisual');
             if (weaponVisual && gameState === 'game' && mode === 'play') {
-                // Use SCALED position
                 const visualLeft = player.visualX * currentTilePixelSize + currentTilePixelSize / 2;
                 const visualTop = player.visualY * currentTilePixelSize + currentTilePixelSize / 2;
                 weaponVisual.style.transform = `translate(${visualLeft}px, ${visualTop}px)`;
@@ -568,7 +637,6 @@
             // Redraw the entire game state
             drawGame();
 
-            // Loop: Continue if in game state or if movement/effects are ongoing
             if (gameState === 'game' || isMoving || trailEffect.opacity > 0 || isSwinging) {
                 animationFrameId = requestAnimationFrame(animate);
             } else {
@@ -657,7 +725,7 @@
             ctx.fill();
         }
         
-        function drawHealthBar(x, y, current, max) {
+        function drawHealthBar(x, y, current, max, color) {
             const tileP = currentTilePixelSize;
             const startX = x * tileP;
             const startY = y * tileP;
@@ -667,9 +735,6 @@
             const barY = startY - barHeight; 
 
             const healthPct = current / max;
-            let color = 'red';
-            if (healthPct > 0.5) color = '#4ade80'; 
-            else if (healthPct > 0.2) color = '#facc15'; 
 
             // Background bar
             ctx.fillStyle = '#1f2937'; 
@@ -681,7 +746,39 @@
 
             // Border
             ctx.strokeStyle = '#000';
-            ctx.lineWidth = 0.5 * (currentCanvasSize / 800); // Scale border thickness
+            ctx.lineWidth = 0.5 * (currentCanvasSize / 800); 
+            ctx.strokeRect(barX, barY, barWidth, barHeight);
+        }
+
+        function drawPlayerHealthBar(x, y) {
+            const tileP = currentTilePixelSize;
+            const startX = x * tileP;
+            const startY = y * tileP;
+            
+            const barWidth = tileP * 0.8;
+            const barHeight = tileP * 0.15; 
+            const barX = startX + (tileP - barWidth) / 2;
+            const barY = startY + tileP - barHeight * 1.5; // Positioning the bar above the avatar bottom
+            
+            const healthPct = player.currentHealth / player.maxHealth;
+            const staminaPct = player.currentStamina / player.maxStamina;
+
+            // Health Bar
+            ctx.fillStyle = '#1f2937'; 
+            ctx.fillRect(barX, barY, barWidth, barHeight * 0.45);
+            ctx.fillStyle = healthPct > 0.2 ? '#dc2626' : '#991b1b'; 
+            ctx.fillRect(barX, barY, barWidth * healthPct, barHeight * 0.45);
+
+            // Stamina Bar
+            const staminaY = barY + barHeight * 0.55;
+            ctx.fillStyle = '#1f2937'; 
+            ctx.fillRect(barX, staminaY, barWidth, barHeight * 0.45);
+            ctx.fillStyle = '#2563eb'; 
+            ctx.fillRect(barX, staminaY, barWidth * staminaPct, barHeight * 0.45);
+
+            // Border
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 0.5 * (currentCanvasSize / 800);
             ctx.strokeRect(barX, barY, barWidth, barHeight);
         }
 
@@ -738,23 +835,28 @@
                 ctx.fill();
                 
                 // Draw Health Bar
-                drawHealthBar(enemy.x, enemy.y, enemy.health, enemy.maxHealth);
+                let healthColor = 'red';
+                if (enemy.health / enemy.maxHealth > 0.5) healthColor = '#4ade80'; 
+                else if (enemy.health / enemy.maxHealth > 0.2) healthColor = '#facc15'; 
+
+                drawHealthBar(enemy.x, enemy.y, enemy.health, enemy.maxHealth, healthColor);
             });
 
 
-            // 3. Draw the player
+            // 3. Draw the player and their status bars
             if (mode === 'play') {
                 drawAvatar(player.visualX, player.visualY, tileP);
+                drawPlayerHealthBar(player.visualX, player.visualY);
             }
 
             // 4. Draw current mode indicator on canvas (Scaled text)
             ctx.fillStyle = mode === 'edit' ? 'rgba(255, 0, 0, 0.9)' : 'rgba(255, 255, 255, 0.9)';
-            const fontSize = Math.max(12, currentCanvasSize / 50); // Scale font size
+            const fontSize = Math.max(12, currentCanvasSize / 50); 
             ctx.font = `700 ${fontSize}px Inter, sans-serif`;
             ctx.fillText(mode.toUpperCase(), currentCanvasSize * 0.0125, currentCanvasSize * 0.025);
         }
 
-        // --- MOVEMENT & EDITOR LOGIC (SCALED INPUT) ---
+        // --- MOVEMENT & EDITOR LOGIC ---
 
         function isTileTraversable(x, y) {
             if (x < 0 || x >= MAP_SIZE || y < 0 || y >= MAP_SIZE) return false;
@@ -815,12 +917,22 @@
 
         // --- UI DRAWING & GAME MODE LOGIC ---
 
-        function updateWeaponUI() {
+        function updateStatusUI() {
             if (!player.weapon) return;
             
-            // Use toLocaleString for better formatting of large numbers
             document.getElementById('currency-display').textContent = `${CURRENCY_NAME}: ${player.currency.toLocaleString()} G`;
+            
+            // 1. Health Bar Update
+            const healthPct = (player.currentHealth / player.maxHealth) * 100;
+            document.getElementById('health-bar').style.width = `${healthPct}%`;
+            document.getElementById('health-text').textContent = `${player.currentHealth} / ${player.maxHealth}`;
 
+            // 2. Stamina Bar Update
+            const staminaPct = (player.currentStamina / player.maxStamina) * 100;
+            document.getElementById('stamina-bar').style.width = `${staminaPct}%`;
+            document.getElementById('stamina-text').textContent = `${Math.floor(player.currentStamina)} / ${player.maxStamina}`;
+            
+            // 3. Weapon Display Update (Unchanged)
             const w = player.weapon;
             const template = WEAPON_TEMPLATES[w.type];
             const missingDurability = w.maxDurability - w.currentDurability;
@@ -848,12 +960,15 @@
 
             const repairBtn = document.getElementById('repair-btn');
             const upgradeBtn = document.getElementById('upgrade-btn');
+            const useWeaponBtn = document.getElementById('use-weapon-btn');
 
             repairBtn.disabled = w.currentDurability === w.maxDurability || player.currency < repairCost;
             upgradeBtn.disabled = w.currentDurability !== w.maxDurability || player.currency < upgradeCost;
+            useWeaponBtn.disabled = player.currentStamina < SWING_STAMINA_COST || w.currentDurability <= 0;
 
             repairBtn.textContent = w.currentDurability === w.maxDurability ? 'Repaired (Full)' : `Repair (${repairCost.toLocaleString()} G)`;
             upgradeBtn.textContent = `Upgrade (Lv.${w.level + 1} - ${upgradeCost.toLocaleString()} G)`;
+            useWeaponBtn.textContent = useWeaponBtn.disabled ? `Low Stamina / Broken Weapon` : `Use Weapon (-${SWING_STAMINA_COST} St.)`;
         }
 
 
@@ -873,19 +988,22 @@
             
             player.currency = player.currency || STARTING_GOLD;
             player.weapon = player.weapon || initializePlayerWeapon();
+            player.currentHealth = player.currentHealth || STARTING_HEALTH;
+            player.currentStamina = player.currentStamina || STARTING_STAMINA;
             player.visualX = player.x;
             player.visualY = player.y;
 
             document.getElementById('app-content').classList.remove('hidden');
             document.getElementById('menu-screen').classList.add('hidden');
+            document.getElementById('game-over-screen').classList.add('hidden'); // Ensure game over is hidden
             
             mode = 'play'; 
-            updateModeUI(); // Call new helper function to update all mode related UI
+            updateModeUI(); 
             
-            updateWeaponUI(); 
+            updateStatusUI(); 
             startEnemyAI(); 
             if (!animationFrameId) animate();
-            handleResize(); // Initial resize call after starting game
+            handleResize(); 
         }
 
         function updateModeUI() {
@@ -914,7 +1032,6 @@
         // --- UI & EVENT HANDLERS ---
         
         function initializeView() {
-            // Setup ResizeObserver to handle screen/container changes
             const observer = new ResizeObserver(() => {
                 handleResize();
             });
@@ -930,39 +1047,40 @@
                 document.getElementById('app-content').classList.remove('hidden');
                 document.getElementById('menu-screen').classList.add('hidden');
             }
-            // Initial call to set canvas size correctly
+            document.getElementById('game-over-screen').classList.add('hidden');
+
             handleResize(); 
         }
 
         document.addEventListener('keydown', (e) => {
-            if (mode === 'play') {
-                if (isMoving && e.key !== 'z' && e.key !== 'Z') return; 
+            if (gameState !== 'game' || mode === 'edit') return;
 
-                switch (e.key.toLowerCase()) {
-                    case 'arrowup':
-                    case 'w':
-                        movePlayer(0, -1);
-                        break;
-                    case 'arrowdown':
-                    case 's':
-                        movePlayer(0, 1);
-                        break;
-                    case 'arrowleft':
-                    case 'a':
-                        movePlayer(-1, 0);
-                        break;
-                    case 'arrowright':
-                    case 'd':
-                        movePlayer(1, 0);
-                        break;
-                    case 'z': 
-                        useWeapon();
-                        break;
-                    default:
-                        return;
-                }
-                e.preventDefault();
+            if (isMoving && e.key !== 'z' && e.key !== 'Z') return; 
+
+            switch (e.key.toLowerCase()) {
+                case 'arrowup':
+                case 'w':
+                    movePlayer(0, -1);
+                    break;
+                case 'arrowdown':
+                case 's':
+                    movePlayer(0, 1);
+                    break;
+                case 'arrowleft':
+                case 'a':
+                    movePlayer(-1, 0);
+                    break;
+                case 'arrowright':
+                case 'd':
+                    movePlayer(1, 0);
+                    break;
+                case 'z': 
+                    useWeapon();
+                    break;
+                default:
+                    return;
             }
+            e.preventDefault();
         });
 
         if (canvas) canvas.addEventListener('click', handleTileClick);
@@ -972,8 +1090,18 @@
         document.getElementById('repair-btn').addEventListener('click', repairWeapon);
         document.getElementById('upgrade-btn').addEventListener('click', upgradeWeapon);
         document.getElementById('use-weapon-btn').addEventListener('click', useWeapon);
-        // New event listener for the cheat button
         document.getElementById('mega-gold-btn').addEventListener('click', grantMegaGold);
+        document.getElementById('restart-btn').addEventListener('click', () => {
+            // Simple restart: reset player health/stamina and currency, then start game
+            player.currentHealth = player.maxHealth;
+            player.currentStamina = player.maxStamina;
+            player.currency = STARTING_GOLD;
+            player.weapon = initializePlayerWeapon();
+            enemies = spawnInitialEnemies(5);
+            savePlayerState();
+            saveMapToFirestore();
+            startGame();
+        });
 
         function createMessage(type, content) {
             const baseClasses = 'p-3 rounded-lg text-sm transition-all duration-300';
@@ -1006,7 +1134,6 @@
         window.onload = () => {
             initFirebase();
             initializeView(); 
-            // drawGame is called inside handleResize
         };
 
     </script>
@@ -1014,7 +1141,6 @@
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap');
         @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
         
-        /* Ensure body and html take full height and remove padding for clean fullscreen overlay */
         html, body {
             height: 100%;
             margin: 0;
@@ -1023,12 +1149,11 @@
             background-color: #f7f9fb;
         }
 
-        /* Responsive Canvas Container */
         #game-container {
             position: relative; 
-            width: 100%; /* Take full width of parent */
-            aspect-ratio: 1 / 1; /* Maintain a 1:1 square ratio */
-            max-width: 800px; /* Cap the max size on very large screens */
+            width: 100%; 
+            aspect-ratio: 1 / 1; 
+            max-width: 800px; 
         }
         
         #gameCanvas {
@@ -1038,7 +1163,6 @@
             box-shadow: 0 10px 15px rgba(0, 0, 0, 0.2);
             touch-action: none; 
             filter: grayscale(30%) saturate(80%) hue-rotate(-10deg); 
-            /* CRITICAL: Canvas style to fill 100% of the dynamically sized container */
             width: 100%;
             height: 100%;
         }
@@ -1096,9 +1220,8 @@
             box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
         }
 
-        /* --- COOLER MENU STYLING --- */
+        /* --- MENU STYLING --- */
 
-        /* Animated Title Glow */
         @keyframes title-flicker {
             0%, 18%, 22%, 25%, 53%, 57%, 100% {
                 text-shadow: 
@@ -1114,11 +1237,8 @@
             }
         }
 
-        /* Menu Background with Texture and Vignette */
         #menu-screen {
-            /* Deep, dark background color */
             background-color: #1c1c1c; 
-            /* Subtle texture overlay for a stone/dungeon look */
             background-image: radial-gradient(circle at center, rgba(0, 0, 0, 0) 0%, rgba(0, 0, 0, 0.8) 100%),
                               repeating-linear-gradient(
                 45deg, rgba(50, 50, 50, 0.1) 0, rgba(50, 50, 50, 0.1) 1px, transparent 1px, transparent 100px
@@ -1127,12 +1247,11 @@
 
         #menu-title {
             font-family: 'Press Start 2P', cursive;
-            color: #d1d5db; /* Light gray for the base */
+            color: #d1d5db; 
             letter-spacing: 5px;
-            animation: title-flicker 4s infinite alternate; /* Apply the flicker animation */
+            animation: title-flicker 4s infinite alternate; 
         }
         
-        /* Stylized Compass Icon Animation */
         @keyframes spin {
             from { transform: rotate(0deg); }
             to { transform: rotate(360deg); }
@@ -1141,14 +1260,13 @@
             animation: spin 30s linear infinite;
         }
 
-        /* Improved Button Styling */
         .menu-button {
             padding: 1rem 3rem;
-            background-color: #a8a29e; /* Stone/Metal color */
-            border: 4px solid #44403c; /* Dark border */
+            background-color: #a8a29e; 
+            border: 4px solid #44403c; 
             color: #1c1c1c;
             font-weight: bold;
-            font-family: 'Press Start 2P', cursive; /* Use game font for button */
+            font-family: 'Press Start 2P', cursive; 
             text-shadow: 1px 1px #e5e7eb;
             box-shadow: 0 6px 0 #44403c, 0 10px 20px rgba(0,0,0,0.6);
             transition: transform 0.1s, background-color 0.1s, box-shadow 0.1s;
@@ -1164,7 +1282,22 @@
             transform: translateY(2px);
             box-shadow: 0 2px 0 #44403c;
         }
-        /* --- END COOLER MENU STYLING --- */
+
+        .bar-container {
+            border: 1px solid #d1d5db;
+            border-radius: 9999px;
+            overflow: hidden;
+        }
+        
+        .health-bar-fill {
+            transition: width 0.3s ease-out;
+            background-color: #ef4444; /* Red */
+        }
+        
+        .stamina-bar-fill {
+            transition: width 0.3s ease-out;
+            background-color: #3b82f6; /* Blue */
+        }
 
         button:disabled {
             opacity: 0.5;
@@ -1176,10 +1309,18 @@
 </head>
 <body class="min-h-screen flex items-start justify-center p-2 sm:p-4">
 
+    <!-- Game Over Screen -->
+    <div id="game-over-screen" class="fixed inset-0 z-50 flex flex-col items-center justify-center bg-red-900 bg-opacity-95 hidden">
+        <h1 class="text-6xl font-extrabold text-white mb-4 animate-pulse">GAME OVER</h1>
+        <p class="text-xl text-red-200 mb-8">You have been defeated by the dungeon's inhabitants.</p>
+        <button id="restart-btn" class="menu-button rounded-lg bg-yellow-500 hover:bg-yellow-600 border-yellow-800 text-gray-900">
+            RESTART QUEST
+        </button>
+    </div>
+
     <!-- Main Menu Screen Overlay -->
     <div id="menu-screen" class="fixed inset-0 z-50 flex flex-col items-center justify-center hidden">
         
-        <!-- Stylized Icon/Graphic -->
         <svg class="w-20 h-20 mb-6 text-yellow-500 spinning-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 2v2m0 16v2M4 12H2m20 0h-2M6.34 6.34l1.42 1.42M16.24 16.24l1.42 1.42M6.34 17.66l1.42-1.42M16.24 7.76l1.42-1.42"></path>
@@ -1200,16 +1341,13 @@
         </p>
     </div>
 
-    <!-- Existing Game Content Container - Now fully responsive -->
+    <!-- Existing Game Content Container -->
     <div id="app-content" class="flex flex-col lg:flex-row gap-4 sm:gap-8 w-full max-w-7xl">
         
-        <!-- Game Canvas Area - Takes up available space -->
         <div class="flex flex-col items-center justify-center lg:flex-1 w-full">
             <h1 class="text-xl sm:text-3xl font-bold text-gray-800 mb-4 text-center">The Explorer's Canvas</h1>
             
-            <!-- Game Container is constrained to maintain 1:1 aspect ratio -->
             <div id="game-container" class="relative">
-                <!-- Canvas has no fixed size here, it gets set by JS (handleResize) -->
                 <canvas id="gameCanvas"></canvas>
                 
                 <div id="playerWeaponVisual" style="display: none;">
@@ -1218,19 +1356,42 @@
             </div>
         </div>
 
-        <!-- Control Panel - Width adapts on smaller screens -->
+        <!-- Control Panel -->
         <div class="control-panel p-4 sm:p-6 lg:w-96 w-full mt-4 lg:mt-0">
-            <h2 class="text-xl sm:text-2xl font-bold text-gray-700 mb-4 border-b pb-2">Admin Tools & Progression</h2>
+            <h2 class="text-xl sm:text-2xl font-bold text-gray-700 mb-4 border-b pb-2">Status & Controls</h2>
             
             <div class="space-y-4">
+
+                <!-- New Health Bar -->
+                <div class="space-y-1">
+                    <p class="font-bold text-red-600 flex justify-between items-center">
+                        HEALTH
+                        <span id="health-text" class="text-sm font-normal">100 / 100</span>
+                    </p>
+                    <div class="bar-container h-3 bg-gray-200">
+                        <div id="health-bar" class="health-bar-fill h-full rounded-full" style="width: 100%;"></div>
+                    </div>
+                </div>
+
+                <!-- New Stamina Bar -->
+                <div class="space-y-1">
+                    <p class="font-bold text-blue-600 flex justify-between items-center">
+                        STAMINA
+                        <span id="stamina-text" class="text-sm font-normal">100 / 100</span>
+                    </p>
+                    <div class="bar-container h-3 bg-gray-200">
+                        <div id="stamina-bar" class="stamina-bar-fill h-full rounded-full" style="width: 100%;"></div>
+                    </div>
+                </div>
+
+                <p id="currency-display" class="text-lg font-semibold text-yellow-700 border-t pt-4">Gold: 0</p>
                 
-                <p id="mode-status" class="text-lg font-semibold text-gray-600">Current Mode: PLAY</p>
+                <p id="mode-status" class="text-lg font-semibold text-gray-600 border-t pt-4">Current Mode: PLAY</p>
                 
                 <button id="mode-toggle-btn" class="w-full py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg shadow-md transition duration-150 ease-in-out transform hover:scale-[1.02]">
                     Switch to Edit Mode
                 </button>
                 
-                <!-- NEW ADMIN BUTTON for 1M Gold, initially hidden in Play Mode -->
                 <button id="mega-gold-btn" class="w-full py-2 px-4 bg-red-800 hover:bg-red-700 text-white font-bold rounded-lg shadow-md transition duration-150 ease-in-out text-sm" style="display: none;">
                     ADMIN: Grant 1,000,000 Gold
                 </button>
@@ -1242,7 +1403,6 @@
                 <!-- Weapon Station -->
                 <div class="border-t pt-4">
                     <h3 class="text-xl font-bold text-gray-700 mb-2">Weapon Station</h3>
-                    <p id="currency-display" class="text-lg font-semibold text-yellow-700 mb-4">Gold: 0</p>
                     
                     <!-- Weapon Display -->
                     <div id="weapon-display" class="bg-gray-100 p-3 rounded-lg space-y-2 border border-gray-300">
@@ -1271,7 +1431,8 @@
                         <p class="font-semibold text-green-700">Play Mode:</p>
                         <ul class="list-disc list-inside ml-2">
                             <li>Use **WASD** or **Arrow Keys** to move.</li>
-                            <li>Press **Z** or click **Use Weapon** to swing the sword and attack goblins!</li>
+                            <li>Press **Z** or click **Use Weapon** to attack (-20 Stamina).</li>
+                            <li>Stamina regenerates when idle.</li>
                         </ul>
                     </div>
                     
@@ -1279,7 +1440,7 @@
                         <p class="font-semibold text-red-700">Edit Mode (Admin):</p>
                         <ul class="list-disc list-inside ml-2">
                             <li>Click on any tile to cycle through tile types.</li>
-                            <li>Use the **ADMIN button** above to get instant gold for testing upgrades!</li>
+                            <li>Use the **ADMIN button** above for cheat gold.</li>
                         </ul>
                     </div>
                 </div>
@@ -1287,7 +1448,7 @@
                 <div class="border-t pt-4 mt-4">
                     <p id="user-id-display" class="text-xs text-gray-400">User ID: Loading...</p>
                     <p class="text-xs text-gray-400">Map Data and Enemy state are Public/Shared.</p>
-                    <p class="text-xs text-gray-400">Player Data (Gold/Weapon) is Private.</p>
+                    <p class="text-xs text-gray-400">Player Data (Stats/Gear) is Private.</p>
                 </div>
             </div>
         </div>
